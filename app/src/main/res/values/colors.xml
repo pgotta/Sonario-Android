@@ -1,0 +1,9 @@
+<resources>
+    <color name="abyss">#16222f</color>
+    <color name="deep">#1b2a3a</color>
+    <color name="panel">#26384c</color>
+    <color name="panel2">#2b3e54</color>
+    <color name="ink">#e8eef4</color>
+    <color name="green">#5cc7a4</color>
+    <color name="teal">#5fb0c4</color>
+</resources>

@@ -1,0 +1,7 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.Sonario" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#1b2a3a</item>
+        <item name="android:navigationBarColor">#16222f</item>
+        <item name="android:windowBackground">@color/deep</item>
+    </style>
+</resources>
