@@ -18,6 +18,24 @@ Sonario has two engines, and you pick which to use per summary:
   phone except fetching the link), but slow: CPU-only, so a summary takes minutes
   and the phone warms up. A private fallback rather than the daily driver.
 
+## Screenshots
+
+> Add three screenshots to `docs/screenshots/` (`main.png`, `summary.png`,
+> `setup.png`) - see that folder's README. Until then these images show as broken.
+
+<p align="center">
+  <img src="docs/screenshots/main.png" width="30%" alt="Main screen" />
+  &nbsp;
+  <img src="docs/screenshots/summary.png" width="30%" alt="Summary of a YouTube video" />
+  &nbsp;
+  <img src="docs/screenshots/setup.png" width="30%" alt="First-run engine and model setup" />
+</p>
+
+<p align="center">
+  <em>Left: paste a link and pick an engine. Center: a summarized YouTube video
+  with Normal / Detailed / Bullets views. Right: first-run setup.</em>
+</p>
+
 ## Quick start (Groq cloud, the fast path)
 
 1. Install the APK (see below) and open Sonario.

@@ -10,6 +10,7 @@ import ai.sonario.app.llm.GroqEngine
 import ai.sonario.app.llm.LlmEngine
 import ai.sonario.app.llm.ModelDownloader
 import ai.sonario.app.llm.ModelInfo
+import ai.sonario.app.llm.RateLimiter
 import ai.sonario.app.source.SourceFetcher
 import ai.sonario.app.summarize.SummarizeEngine
 import kotlinx.coroutines.Job
@@ -38,6 +39,7 @@ data class UiState(
     val progressCurrent: Int = 0,
     val progressTotal: Int = 0,
     val liveText: String = "",
+    val rateWaitSeconds: Long = 0,
     val result: SummarizeEngine.Result? = null,
     val view: SummaryView = SummaryView.NORMAL,
     val error: String? = null,
@@ -57,14 +59,28 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
     private val fetcher = SourceFetcher()
     private val downloader = ModelDownloader(llm.modelsDir())
     private val settings = Settings(app)
+    private val rateLimiter = RateLimiter(app)
     private val groq = GroqEngine(
         apiKeyProvider = { settings.groqApiKey },
         modelProvider = { settings.groqModel },
+        rateLimiter = rateLimiter,
+        onRateWait = { secs -> onRateWait(secs) },
     )
 
     private var downloadJob: Job? = null
     // Progress collection job for whichever SummarizeEngine is active.
     private var progressJob: Job? = null
+
+    /** Called from the Groq engine while it waits for a rate-limit slot. */
+    private fun onRateWait(secs: Long) {
+        _ui.value = _ui.value.copy(rateWaitSeconds = secs)
+    }
+
+    /** Tokens used today against the free-tier daily cap, for display. */
+    fun groqDailyUsage(): Pair<Long, Long> {
+        val u = rateLimiter.dailyUsage()
+        return u.used to u.limit
+    }
 
     private val _ui = MutableStateFlow(initialState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
@@ -190,12 +206,14 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
                     progressCurrent = p.current,
                     progressTotal = p.total,
                     liveText = p.live,
+                    // tokens flowing means we're not waiting on the rate limit
+                    rateWaitSeconds = if (p.live.isNotBlank()) 0 else _ui.value.rateWaitSeconds,
                 )
             }
         }
 
         _ui.value = state.copy(busy = true, error = null, result = null,
-            phase = "fetching", liveText = "")
+            phase = "fetching", liveText = "", rateWaitSeconds = 0)
         viewModelScope.launch {
             try {
                 val src = fetcher.fetch(state.input)
@@ -212,7 +230,7 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
                     approxMinutes = src.approxMinutes,
                 )
                 _ui.value = _ui.value.copy(busy = false, result = result,
-                    view = SummaryView.NORMAL, liveText = "")
+                    view = SummaryView.NORMAL, liveText = "", rateWaitSeconds = 0)
             } catch (e: Exception) {
                 _ui.value = _ui.value.copy(busy = false,
                     error = e.message ?: "Summarize failed.")

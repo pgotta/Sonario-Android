@@ -238,6 +238,16 @@ private fun ProgressCard(ui: UiState) {
             }
             Text(label, color = SonarioColors.InkSoft,
                 style = MaterialTheme.typography.labelLarge)
+
+            if (ui.rateWaitSeconds > 0) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Pacing for Groq's rate limit, resuming in ${ui.rateWaitSeconds}s. " +
+                    "Large videos are sent in timed batches so they don't get blocked.",
+                    color = SonarioColors.Teal,
+                    style = MaterialTheme.typography.bodyMedium)
+            }
+
             Spacer(Modifier.height(10.dp))
             if (ui.progressTotal > 0 && ui.phase == "condensing") {
                 LinearProgressIndicator(
