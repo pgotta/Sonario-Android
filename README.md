@@ -1,103 +1,134 @@
 # Sonario for Android
 
-A native Android port of the Sonario summarizer that runs a language model
-**fully on the phone** via llama.cpp. Paste a YouTube link, an article URL, or
-text, and it produces skimmable notes, a detailed prose view, or a bulleted
-outline. Nothing you summarize leaves the device.
+Summarize YouTube videos, web articles, and pasted text on your phone. Paste a
+link (or share one into the app) and get skimmable notes, a detailed prose view,
+or a bulleted outline.
 
-## Status: working proof-of-concept, not production-usable
+**Status:** working. YouTube transcript summarization, web-article and pasted-text
+summarization, the Groq cloud engine, and the on-device engine are all functional
+as of version 1.1.0.
 
-Be aware before you build this: **it works, but it is too slow to use day to
-day.** The model runs on the phone's CPU. The Llamatik/llama.cpp build used here
-has no Adreno (Qualcomm) GPU backend, so on a Snapdragon phone every token is
-generated on CPU. In practice that means:
+Sonario has two engines, and you pick which to use per summary:
 
-- A short article or transcript takes minutes, not seconds.
-- The phone gets warm and the CPU sits near 100% during a summary (the built-in
-  meter shows this).
-- Large documents are deliberately capped so a job can't run for hours.
+- **Groq cloud** (recommended) - sends your text to Groq's API and summarizes
+  with a large model (Llama 4 Scout by default) in seconds. Fast, handles big
+  documents in one pass. You bring your own free API key. Your text goes to
+  Groq's servers.
+- **On-device** - runs a model locally via llama.cpp. Private (nothing leaves the
+  phone except fetching the link), but slow: CPU-only, so a summary takes minutes
+  and the phone warms up. A private fallback rather than the daily driver.
 
-This project is published as an honest proof-of-concept: the full pipeline works
-end to end (model download, source fetching, on-device summarization, three
-summary views), and the inference layer is isolated behind one small interface
-(`LlmEngine`) so it can be swapped later. If and when a fast on-device backend
-with GPU/NPU support becomes available for Android (or you point it at a remote
-server), this becomes genuinely usable with a change to that one file.
+## Quick start (Groq cloud, the fast path)
 
-If you want a usable version today, the realistic path is to change `LlmEngine`
-to call a remote llama.cpp/Ollama server on a PC over your LAN or Tailscale,
-keeping this UI. See "Swapping the engine" below.
+1. Install the APK (see below) and open Sonario.
+2. On the first screen, tap **Use Groq cloud instead** (skips the local-model
+   download).
+3. Get a free Groq API key at console.groq.com (no credit card). Create a key.
+4. In Sonario's Settings, paste the key and tap **Save key**.
+5. Back on the main screen, make sure the toggle is on **Groq cloud**, paste a
+   YouTube link or article URL, and tap **Summarize**.
 
-## What works
+## Quick start (on-device, fully private)
 
-- **YouTube** - fetches captions via YouTube's InnerTube player API (no audio
-  download) and summarizes them. This scrapes an undocumented endpoint, so it can
-  break if YouTube changes it.
-- **Web pages** - extracts article text with Jsoup and summarizes it.
-- **Pasted text** - summarizes any text.
-- **Three views**, generated up front so toggling is instant: Normal (skimmable
-  Markdown notes), Detailed (longer prose), Bullets (plain outline).
-- **First-run model picker** - downloads one of three GGUF models in-app with a
-  progress bar and resume. No adb, no manual file copying.
-- **Share target** - share a link from YouTube or a browser into Sonario.
-- **System meter** - a small bottom-left readout of CPU load and RAM. GPU% and
-  VRAM are intentionally absent: Android exposes no API for them without root.
+1. Open Sonario. On the first screen, tap **Get** on a model (Qwen2.5 1.5B is the
+   fastest). It downloads in-app (~1 GB, use Wi-Fi).
+2. When it finishes, make sure the toggle is on **On-device**, paste a source,
+   and tap **Summarize**. Expect it to take a few minutes; the CPU meter at the
+   bottom-left will sit near 100%.
 
-## Models (downloaded on first run, not bundled)
+## Supported links
+
+YouTube links in any common shape all work:
+
+- `youtu.be/VIDEO_ID` (short link)
+- `youtube.com/watch?v=VIDEO_ID`
+- `m.youtube.com/watch?v=VIDEO_ID` (mobile)
+- `youtube.com/shorts/VIDEO_ID`, `/live/VIDEO_ID`, `/embed/VIDEO_ID`
+- Extra share parameters like `?si=...` are ignored.
+
+You can also share a link from the YouTube or browser app straight into Sonario
+via the Android share sheet. Web article URLs and raw pasted text also work.
+
+## Privacy, stated plainly
+
+The two engines differ, and the app shows which is active:
+
+- On-device: summarization happens locally. The only network calls are the
+  one-time model download and fetching whatever link you paste.
+- Groq cloud: the text to summarize is sent to Groq. Don't use this for anything
+  you wouldn't send to a third-party API. Your Groq key is stored only on your
+  device (local app storage) and is sent solely to Groq.
+
+## How YouTube transcripts are fetched
+
+Version 1.1.0 uses a layered extractor rather than relying on one caption URL:
+
+1. Load the watch page in one cookie-preserving session and handle YouTube's
+   consent page when it appears.
+2. Read the current InnerTube API key, WEB client version, visitor data, and the
+   real `getTranscriptEndpoint.params` value from YouTube's page data.
+3. Prefer `youtubei/v1/next` -> `youtubei/v1/get_transcript`, which returns the
+   transcript segments directly as JSON.
+4. Fall back to consistently identified ANDROID and WEB `player` requests, then
+   download an available caption track.
+5. Parse JSON3, legacy XML, SRV3, TTML, or WebVTT captions.
+
+The extractor preserves signed caption URL parameters when changing formats and
+reports Proof-of-Origin-token tracks accurately instead of claiming the video has
+no captions. These are still undocumented YouTube endpoints, so a future YouTube
+change can require another extractor update. Failed requests show **Extractor
+build 2** diagnostics so you can confirm the new APK is actually installed.
+
+## On-device models (downloaded on first run, not bundled)
 
 | Model | Size | Notes |
 | --- | --- | --- |
-| Qwen2.5 1.5B Instruct | ~1.1 GB | Fastest of the three; the least-slow default |
-| Llama 3.2 3B Instruct | ~2.0 GB | Better output, noticeably slower |
-| Phi-3.5 Mini Instruct | ~2.3 GB | Larger context; slowest |
+| Qwen2.5 1.5B Instruct | ~1.1 GB | Fastest on-device; the default |
+| Llama 3.2 3B Instruct | ~2.0 GB | Better output, slower |
+| Phi-3.5 Mini Instruct | ~2.3 GB | Larger context, slowest |
 
-All are Q4_K_M GGUF from public Hugging Face repos. The model is never bundled in
-the APK (it would blow past install-size limits); it downloads at first launch to
-`Android/data/ai.sonario.app/files/models/`.
+Q4_K_M GGUF from public Hugging Face repos, downloaded at first launch to
+`Android/data/ai.sonario.app/files/models/`. Never bundled in the APK.
+
+On-device inference is CPU-only: the llama.cpp build here has no Adreno GPU
+backend, so on a Snapdragon phone every token is generated on CPU. It works and
+is genuinely private, but Groq is far more practical for everyday use.
+
+## Crash diagnostics
+
+If the app ever crashes, it writes the stack trace to
+`Android/data/ai.sonario.app/files/last_crash.txt` and shows it on the next
+launch (with a Copy button) instead of silently closing.
 
 ## Architecture
 
-The app is a Kotlin/Jetpack Compose reimplementation of Sonario desktop's
-summarize pipeline. It shares no code with the Python/Flask desktop app; it
-mirrors its logic (chunk -> condense -> combine map-reduce) and reuses its
-prompts so output style matches.
+Kotlin/Jetpack Compose. Both engines implement one interface, `InferenceEngine`,
+and the summarize pipeline talks only to that:
 
-Key pieces:
-
-- `llm/LlmEngine.kt` - the entire on-device inference layer, behind a small
-  interface. **This is the one file to change to swap backends.**
+- `llm/InferenceEngine.kt` - shared interface (`ensureReady`, `stream`).
+- `llm/LlmEngine.kt` - on-device via Llamatik/llama.cpp.
+- `llm/GroqEngine.kt` - Groq cloud via the OpenAI-compatible streaming API.
 - `llm/ModelDownloader.kt` - resumable GGUF download.
+- `data/Settings.kt` - engine choice, Groq key, Groq model (local prefs).
 - `source/SourceFetcher.kt` - YouTube (InnerTube) and web-article fetching.
-- `summarize/SummarizeEngine.kt` - the map-reduce summarizer with an on-device
-  work cap (bounded chunk count so a huge PDF can't run for hours).
+- `summarize/SummarizeEngine.kt` - map-reduce summarizer; chunking adapts to the
+  engine (small bounded chunks on-device, large/one-pass for the 128k cloud model).
 - `summarize/Prompts.kt` - prompts carried over from Sonario desktop.
-- `ui/` - Compose screens, theme, the radar `DepthMark`, and the `SysMeter`.
+- `ui/` - Compose screens, theme, settings, the CPU/RAM meter, crash screen.
+- `CrashReporter.kt` - global uncaught-exception logger.
 
-## Swapping the engine
-
-Everything inference-related lives in `LlmEngine.kt` behind these methods:
-`ensureLoaded`, `stream(system, user)`, `complete(...)`, `unload`. To retarget
-the app at a remote server (a PC running llama.cpp's server or Ollama), replace
-the Llamatik calls in those methods with HTTP calls to that server and keep the
-rest of the app unchanged. The summarize pipeline, UI, and source fetching don't
-need to know where the tokens come from.
+To add another backend (e.g. a self-hosted llama.cpp/Ollama server on a PC),
+implement `InferenceEngine` and hand it to `SummarizeEngine`. `GroqEngine` is the
+template for an HTTP-based engine.
 
 ## Build
 
-See BUILD.md. Short version: open in Android Studio, let it sync, and use
-**Build -> Build APK(s)**. Requires a recent Android Studio (Kotlin 2.2.x,
-Android Gradle Plugin 8.7.x, compileSdk 36). No NDK needed; Llamatik ships
-prebuilt native binaries.
-
-## Privacy
-
-The summarizer is fully local. Bytes leave the device only for the one-time model
-download and for fetching a link you paste. Pasted text never touches the network.
+See BUILD.md.
 
 ## Credits
 
-Port of Sonario desktop by pgotta. On-device inference via llama.cpp through the
-Llamatik library.
+Port of Sonario desktop by pgotta. On-device inference via llama.cpp/Llamatik;
+cloud inference via Groq.
 
 ## License
 

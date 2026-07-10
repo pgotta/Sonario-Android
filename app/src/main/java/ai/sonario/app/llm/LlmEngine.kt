@@ -23,10 +23,13 @@ import java.io.File
  * The whole app is written against this small interface, so swapping inference
  * backends later means editing only this file.
  */
-class LlmEngine private constructor(private val appContext: Context) {
+class LlmEngine private constructor(private val appContext: Context) : InferenceEngine {
 
     @Volatile var loadedModel: String? = null
         private set
+
+    /** InferenceEngine entry point: for on-device this loads the GGUF. */
+    override suspend fun ensureReady(model: ModelInfo) = ensureLoaded(model)
 
     /** Where downloaded GGUF models live. */
     fun modelsDir(): File =
@@ -87,7 +90,7 @@ class LlmEngine private constructor(private val appContext: Context) {
      * Uses Llamatik's generateWithContextStream with an empty context block;
      * Sonario folds everything into system + user, matching the desktop app.
      */
-    fun stream(system: String, user: String, maxTokens: Int = 1024): Flow<String> =
+    override fun stream(system: String, user: String, maxTokens: Int): Flow<String> =
         callbackFlow {
             // maxTokens can change per call without a reload.
             runCatching {
@@ -122,13 +125,6 @@ class LlmEngine private constructor(private val appContext: Context) {
                 job.cancel()
             }
         }.flowOn(Dispatchers.Default)
-
-    /** Blocking convenience: run [stream] to completion and return the text. */
-    suspend fun complete(system: String, user: String, maxTokens: Int = 1024): String {
-        val sb = StringBuilder()
-        stream(system, user, maxTokens).collect { sb.append(it) }
-        return sb.toString()
-    }
 
     private fun currentContext(): Int =
         BUNDLED_MODELS.firstOrNull { it.fileName == loadedModel }?.contextTokens ?: 4096

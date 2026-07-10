@@ -3,7 +3,10 @@ package ai.sonario.app.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import ai.sonario.app.data.EngineChoice
+import ai.sonario.app.data.Settings
 import ai.sonario.app.llm.BUNDLED_MODELS
+import ai.sonario.app.llm.GroqEngine
 import ai.sonario.app.llm.LlmEngine
 import ai.sonario.app.llm.ModelDownloader
 import ai.sonario.app.llm.ModelInfo
@@ -42,16 +45,26 @@ data class UiState(
     val models: List<ModelInfo> = emptyList(),
     val hasAnyModel: Boolean = false,
     val download: DownloadState = DownloadState(),
+    // engine + cloud settings
+    val engineChoice: EngineChoice = EngineChoice.ON_DEVICE,
+    val groqKeySet: Boolean = false,
+    val groqModel: String = Settings.DEFAULT_GROQ_MODEL,
 )
 
 class SummaryViewModel(app: Application) : AndroidViewModel(app) {
 
     private val llm = LlmEngine.get(app)
     private val fetcher = SourceFetcher()
-    private val engine = SummarizeEngine(llm)
     private val downloader = ModelDownloader(llm.modelsDir())
+    private val settings = Settings(app)
+    private val groq = GroqEngine(
+        apiKeyProvider = { settings.groqApiKey },
+        modelProvider = { settings.groqModel },
+    )
 
     private var downloadJob: Job? = null
+    // Progress collection job for whichever SummarizeEngine is active.
+    private var progressJob: Job? = null
 
     private val _ui = MutableStateFlow(initialState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
@@ -63,20 +76,10 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
             models = models,
             hasAnyModel = present != null,
             model = present ?: models.first(),
+            engineChoice = settings.engine,
+            groqKeySet = settings.hasGroqKey,
+            groqModel = settings.groqModel,
         )
-    }
-
-    init {
-        viewModelScope.launch {
-            engine.progress.collect { p ->
-                _ui.value = _ui.value.copy(
-                    phase = p.phase,
-                    progressCurrent = p.current,
-                    progressTotal = p.total,
-                    liveText = p.live,
-                )
-            }
-        }
     }
 
     fun onInput(s: String) { _ui.value = _ui.value.copy(input = s) }
@@ -89,6 +92,28 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
             models = models,
             hasAnyModel = models.any { it.present },
         )
+    }
+
+    // ── engine + cloud settings ────────────────────────────────────────────────
+
+    fun setEngine(choice: EngineChoice) {
+        settings.engine = choice
+        _ui.value = _ui.value.copy(engineChoice = choice)
+    }
+
+    fun setGroqKey(key: String) {
+        settings.groqApiKey = key
+        _ui.value = _ui.value.copy(groqKeySet = settings.hasGroqKey)
+    }
+
+    fun setGroqModel(model: String) {
+        settings.groqModel = model
+        _ui.value = _ui.value.copy(groqModel = settings.groqModel)
+    }
+
+    fun currentGroqKeyMasked(): String {
+        val k = settings.groqApiKey ?: return ""
+        return if (k.length <= 8) "••••" else k.take(4) + "…" + k.takeLast(4)
     }
 
     // ── model download (first-run picker + Models screen) ──────────────────────
@@ -133,11 +158,42 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
     fun summarize() {
         val state = _ui.value
         if (state.input.isBlank() || state.busy) return
-        if (!llm.isModelPresent(state.model)) {
-            _ui.value = state.copy(
-                error = "That model isn't on the device yet. Download it first.")
-            return
+
+        val useGroq = state.engineChoice == EngineChoice.GROQ
+        if (useGroq) {
+            if (!settings.hasGroqKey) {
+                _ui.value = state.copy(
+                    error = "Groq is selected but no API key is set. Open Settings " +
+                            "and paste your free key from console.groq.com.")
+                return
+            }
+        } else {
+            if (!llm.isModelPresent(state.model)) {
+                _ui.value = state.copy(
+                    error = "That model isn't on the device yet. Download it first.")
+                return
+            }
         }
+
+        // Build the pipeline for the chosen engine. Cloud gets big-context chunking.
+        val summarizer = if (useGroq)
+            SummarizeEngine(groq, bigContext = true)
+        else
+            SummarizeEngine(llm, bigContext = false)
+
+        // Re-subscribe progress to this pipeline instance.
+        progressJob?.cancel()
+        progressJob = viewModelScope.launch {
+            summarizer.progress.collect { p ->
+                _ui.value = _ui.value.copy(
+                    phase = p.phase,
+                    progressCurrent = p.current,
+                    progressTotal = p.total,
+                    liveText = p.live,
+                )
+            }
+        }
+
         _ui.value = state.copy(busy = true, error = null, result = null,
             phase = "fetching", liveText = "")
         viewModelScope.launch {
@@ -148,7 +204,7 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
                         error = src.error ?: "Could not read that source.")
                     return@launch
                 }
-                val result = engine.run(
+                val result = summarizer.run(
                     model = state.model,
                     text = src.text,
                     title = src.title,
@@ -159,7 +215,9 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
                     view = SummaryView.NORMAL, liveText = "")
             } catch (e: Exception) {
                 _ui.value = _ui.value.copy(busy = false,
-                    error = "Summarize failed: ${e.message}")
+                    error = e.message ?: "Summarize failed.")
+            } finally {
+                progressJob?.cancel()
             }
         }
     }

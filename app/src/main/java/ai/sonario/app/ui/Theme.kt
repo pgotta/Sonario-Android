@@ -1,6 +1,5 @@
 package ai.sonario.app.ui
 
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -68,3 +67,19 @@ fun SonarioTheme(content: @Composable () -> Unit) {
         content = content,
     )
 }
+
+/** Shared OutlinedTextField colors for Sonario's dark panels (used by the input
+ *  card and the settings fields so they stay visually identical). */
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+fun sonarioFieldColors() = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+    focusedContainerColor = SonarioColors.Panel2,
+    unfocusedContainerColor = SonarioColors.Panel2,
+    focusedBorderColor = SonarioColors.Green,
+    unfocusedBorderColor = SonarioColors.RuleSoft,
+    cursorColor = SonarioColors.Green,
+    focusedTextColor = SonarioColors.Ink,
+    unfocusedTextColor = SonarioColors.Ink,
+    focusedLabelColor = SonarioColors.InkSoft,
+    unfocusedLabelColor = SonarioColors.Muted,
+)

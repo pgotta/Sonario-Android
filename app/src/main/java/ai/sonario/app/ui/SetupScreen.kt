@@ -22,7 +22,7 @@ import ai.sonario.app.llm.ModelInfo
  * is present, the app routes straight to the summarizer on launch.
  */
 @Composable
-fun SetupScreen(vm: SummaryViewModel) {
+fun SetupScreen(vm: SummaryViewModel, onUseCloud: () -> Unit = {}) {
     val ui by vm.ui.collectAsState()
     val scroll = rememberScrollState()
     val dl = ui.download
@@ -35,9 +35,7 @@ fun SetupScreen(vm: SummaryViewModel) {
                 .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Spacer(Modifier.height(24.dp))
-            DepthMark()
-            Spacer(Modifier.height(14.dp))
+            Spacer(Modifier.height(12.dp))
             Row {
                 Text("Sonar", style = MaterialTheme.typography.headlineLarge,
                     color = SonarioColors.Ink)
@@ -74,12 +72,18 @@ fun SetupScreen(vm: SummaryViewModel) {
 
             Spacer(Modifier.height(16.dp))
             Text(
-                "Nothing you summarize leaves the phone. The only network use is " +
-                "this download and, later, fetching a link you paste.",
+                "On-device keeps everything on your phone but is slow. Prefer speed? " +
+                "You can use the Groq cloud instead (needs a free API key).",
                 style = MaterialTheme.typography.labelLarge,
                 color = SonarioColors.Muted,
                 textAlign = TextAlign.Center,
             )
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(
+                onClick = onUseCloud,
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = SonarioColors.Green),
+            ) { Text("Use Groq cloud instead") }
             Spacer(Modifier.height(24.dp))
         }
     }

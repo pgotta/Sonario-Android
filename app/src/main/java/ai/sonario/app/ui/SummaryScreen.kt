@@ -1,6 +1,10 @@
 package ai.sonario.app.ui
 
+import ai.sonario.app.R
+import ai.sonario.app.data.EngineChoice
+import ai.sonario.app.summarize.SummarizeEngine
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -9,6 +13,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -17,13 +22,20 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.mikepenz.markdown.m3.Markdown
+import com.mikepenz.markdown.m3.markdownColor
+import com.mikepenz.markdown.m3.markdownTypography
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SummaryScreen(vm: SummaryViewModel, onOpenModels: () -> Unit) {
+fun SummaryScreen(
+    vm: SummaryViewModel,
+    onOpenModels: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
     val ui by vm.ui.collectAsState()
     val scroll = rememberScrollState()
 
@@ -34,12 +46,23 @@ fun SummaryScreen(vm: SummaryViewModel, onOpenModels: () -> Unit) {
             CenterAlignedTopAppBar(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        DepthMark(markSize = 26.dp)
+                        Image(
+                            painter = painterResource(
+                                id = R.mipmap.ic_launcher_foreground),
+                            contentDescription = null,
+                            modifier = Modifier.size(30.dp),
+                        )
                         Spacer(Modifier.width(8.dp))
                         Text("Sonar", style = MaterialTheme.typography.titleLarge,
                             color = SonarioColors.Ink)
                         Text("io", style = MaterialTheme.typography.titleLarge,
                             color = SonarioColors.Green)
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Settings",
+                            tint = SonarioColors.InkSoft)
                     }
                 },
                 actions = {
@@ -63,15 +86,31 @@ fun SummaryScreen(vm: SummaryViewModel, onOpenModels: () -> Unit) {
         ) {
             if (ui.result == null) {
                 Spacer(Modifier.height(8.dp))
-                DepthMark()
+                Image(
+                    painter = painterResource(id = R.mipmap.ic_launcher_foreground),
+                    contentDescription = null,
+                    modifier = Modifier.size(64.dp),
+                )
                 Spacer(Modifier.height(10.dp))
-                Text("Summarize anything, on device",
+                val cloud = ui.engineChoice == EngineChoice.GROQ
+                Text(
+                    if (cloud) "Summarize anything, fast"
+                    else "Summarize anything, on device",
                     style = MaterialTheme.typography.headlineMedium,
                     color = SonarioColors.Ink, textAlign = TextAlign.Center)
-                Text("Paste a YouTube link, an article URL, or text. Nothing leaves your phone except the fetch.",
+                Text(
+                    if (cloud)
+                        "Paste a YouTube link, an article URL, or text. Your text is " +
+                        "sent to Groq's cloud to summarize."
+                    else
+                        "Paste a YouTube link, an article URL, or text. On-device: " +
+                        "nothing leaves your phone except the fetch.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = SonarioColors.Muted, textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(top = 6.dp, bottom = 18.dp))
+                    modifier = Modifier.padding(top = 6.dp, bottom = 14.dp))
+
+                EngineToggle(ui, vm)
+                Spacer(Modifier.height(14.dp))
 
                 InputCard(ui, vm)
             }
@@ -95,6 +134,38 @@ fun SummaryScreen(vm: SummaryViewModel, onOpenModels: () -> Unit) {
     }
 }
 
+@Composable
+private fun EngineToggle(ui: UiState, vm: SummaryViewModel) {
+    val options = listOf(
+        EngineChoice.ON_DEVICE to "On-device",
+        EngineChoice.GROQ to "Groq cloud",
+    )
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(SonarioColors.Panel2)
+            .padding(3.dp),
+    ) {
+        options.forEach { (choice, label) ->
+            val selected = choice == ui.engineChoice
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (selected) SonarioColors.Green
+                               else androidx.compose.ui.graphics.Color.Transparent)
+                    .clickable { vm.setEngine(choice) }
+                    .padding(horizontal = 18.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(label,
+                    color = if (selected) SonarioColors.Abyss else SonarioColors.InkSoft,
+                    style = MaterialTheme.typography.labelLarge)
+            }
+        }
+    }
+}
+
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun InputCard(ui: UiState, vm: SummaryViewModel) {
@@ -111,26 +182,26 @@ private fun InputCard(ui: UiState, vm: SummaryViewModel) {
                 modifier = Modifier.fillMaxWidth().heightIn(min = 96.dp),
                 minLines = 3,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedContainerColor = SonarioColors.Panel2,
-                    unfocusedContainerColor = SonarioColors.Panel2,
-                    focusedBorderColor = SonarioColors.Green,
-                    unfocusedBorderColor = SonarioColors.RuleSoft,
-                    cursorColor = SonarioColors.Green,
-                    focusedTextColor = SonarioColors.Ink,
-                    unfocusedTextColor = SonarioColors.Ink,
-                ),
+                colors = sonarioFieldColors(),
             )
             Spacer(Modifier.height(10.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 AssistChip(
                     onClick = {},
                     enabled = false,
-                    label = { Text(ui.model.label, maxLines = 1) },
+                    modifier = Modifier.weight(1f, fill = false),
+                    label = {
+                        val isCloud = ui.engineChoice == EngineChoice.GROQ
+                        Text(
+                            if (isCloud) "Groq: ${shortModel(ui.groqModel)}"
+                            else ui.model.label,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                    },
                     colors = AssistChipDefaults.assistChipColors(
                         disabledLabelColor = SonarioColors.Muted),
                 )
-                Spacer(Modifier.weight(1f))
+                Spacer(Modifier.width(8.dp))
                 Button(
                     onClick = vm::summarize,
                     enabled = !ui.busy && ui.input.isNotBlank(),
@@ -141,7 +212,8 @@ private fun InputCard(ui: UiState, vm: SummaryViewModel) {
                     Icon(Icons.Filled.AutoAwesome, contentDescription = null,
                         modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Summarize", fontWeight = FontWeight.SemiBold)
+                    Text("Summarize", fontWeight = FontWeight.SemiBold,
+                        maxLines = 1, softWrap = false)
                 }
             }
         }
@@ -206,7 +278,7 @@ private fun ErrorCard(msg: String) {
 
 @Composable
 private fun ResultArea(
-    res: ai.sonario.app.summarize.SummarizeEngine.Result,
+    res: SummarizeEngine.Result,
     view: SummaryView,
     vm: SummaryViewModel,
 ) {
@@ -238,7 +310,37 @@ private fun ResultArea(
                 SummaryView.BULLETS -> res.bullets
             }
             Box(Modifier.padding(16.dp)) {
-                Markdown(content = md)
+                Markdown(
+                    content = md,
+                    colors = markdownColor(
+                        text = SonarioColors.Ink,
+                        linkText = SonarioColors.Green,
+                    ),
+                    typography = markdownTypography(
+                        // Section headers: smaller, semibold, Sonario green,
+                        // instead of the library's default huge white text.
+                        h1 = MaterialTheme.typography.titleLarge.copy(
+                            color = SonarioColors.Green,
+                            fontWeight = FontWeight.SemiBold),
+                        h2 = MaterialTheme.typography.titleMedium.copy(
+                            color = SonarioColors.Green,
+                            fontWeight = FontWeight.SemiBold),
+                        h3 = MaterialTheme.typography.titleSmall.copy(
+                            color = SonarioColors.Green,
+                            fontWeight = FontWeight.SemiBold),
+                        h4 = MaterialTheme.typography.labelLarge.copy(
+                            color = SonarioColors.Green,
+                            fontWeight = FontWeight.SemiBold),
+                        h5 = MaterialTheme.typography.labelLarge.copy(
+                            color = SonarioColors.Green),
+                        h6 = MaterialTheme.typography.labelLarge.copy(
+                            color = SonarioColors.Green),
+                        text = MaterialTheme.typography.bodyLarge.copy(
+                            color = SonarioColors.Ink),
+                        paragraph = MaterialTheme.typography.bodyLarge.copy(
+                            color = SonarioColors.Ink),
+                    ),
+                )
             }
         }
 
@@ -285,3 +387,10 @@ private fun ViewToggle(view: SummaryView, vm: SummaryViewModel) {
     }
 }
 
+
+// Trim a Groq model id like "meta-llama/llama-4-scout-17b-16e-instruct" to
+// something short for the chip.
+private fun shortModel(m: String): String {
+    val tail = m.substringAfterLast('/')
+    return if (tail.length > 22) tail.take(22) + "…" else tail
+}

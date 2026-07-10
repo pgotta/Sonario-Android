@@ -1,6 +1,6 @@
 package ai.sonario.app.summarize
 
-import ai.sonario.app.llm.LlmEngine
+import ai.sonario.app.llm.InferenceEngine
 import ai.sonario.app.llm.ModelInfo
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -14,25 +14,26 @@ import kotlinx.coroutines.flow.StateFlow
  * Then Bullets and Detailed views are derived, the way the desktop app
  * generated all views up front so the UI could toggle instantly.
  *
- * KEY MOBILE DIFFERENCE: a small on-device model has roughly a 4k-token context,
- * not the ~12k-char chunks the desktop used against Ollama. So CHUNK_CHARS is
- * much smaller here. Everything else follows the desktop logic.
+ * The engine is an InferenceEngine, so this works with the on-device model or
+ * the Groq cloud engine. Chunking adapts: on-device models have a small (~4k
+ * token) context so chunks are small and the total work is hard-capped; the
+ * cloud path (Llama 4 Scout, 128k context) uses much larger chunks and rarely
+ * needs to chunk at all.
  */
-class SummarizeEngine(private val llm: LlmEngine) {
+class SummarizeEngine(
+    private val engine: InferenceEngine,
+    private val bigContext: Boolean = false,
+) {
 
-    // Desktop used 12000 chars against a large Ollama context. On-device the
-    // model context is ~4k tokens; keep a chunk well under that so the chunk text
-    // plus the prompt plus the output all fit. ~2800 chars ~= 800-900 tokens.
-    private val chunkChars = 2800
-    private val singlePassLimit = 3200   // below this, summarize in one call
+    // On-device: ~2800 chars/chunk (~800 tokens). Cloud: much larger, since a
+    // 128k-context model swallows most sources in one or a few passes.
+    private val chunkChars = if (bigContext) 40000 else 2800
+    private val singlePassLimit = if (bigContext) 120000 else 3200
 
-    // On-device inference is slow, so we cap the amount of work. A huge PDF must
-    // not explode into hundreds of chunks (that would take hours on CPU). We hard
-    // cap the number of condense passes; if the source is bigger than
-    // maxChunks * maxChunkChars, we summarize a representative portion rather than
-    // grinding for hours. This keeps any single job to a bounded, sane runtime.
-    private val maxChunks = 20           // never do more than this many condense passes
-    private val maxChunkChars = 6000     // upper bound on one chunk (~1500 tokens)
+    // Work cap. On-device this bounds runtime (CPU is slow). Cloud can afford
+    // more passes, but we still cap so a giant book stays within rate limits.
+    private val maxChunks = if (bigContext) 40 else 20
+    private val maxChunkChars = if (bigContext) 48000 else 6000
 
     data class Progress(
         val phase: String,      // "fetching" | "chunking" | "condensing" | "synthesizing" | "deriving" | "done"
@@ -60,7 +61,7 @@ class SummarizeEngine(private val llm: LlmEngine) {
         kind: String,
         approxMinutes: Int?,
     ): Result {
-        llm.ensureLoaded(model)
+        engine.ensureReady(model)
 
         val normal: String
         if (text.length <= singlePassLimit) {
@@ -137,7 +138,7 @@ class SummarizeEngine(private val llm: LlmEngine) {
 
     private suspend fun streamCollect(system: String, user: String, maxTokens: Int = 1024): String {
         val sb = StringBuilder()
-        llm.stream(system, user, maxTokens).collect { token ->
+        engine.stream(system, user, maxTokens).collect { token ->
             sb.append(token)
             // surface streaming text to the UI without disturbing phase counters
             val p = _progress.value
