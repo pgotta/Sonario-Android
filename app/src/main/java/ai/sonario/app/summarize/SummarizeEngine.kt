@@ -49,6 +49,7 @@ class SummarizeEngine(
         val title: String,
         val kind: String,
         val approxMinutes: Int?,
+        val chapters: String = "",   // per-chapter EPUB summary, empty if N/A
     )
 
     private val _progress = MutableStateFlow(Progress("idle"))
@@ -91,17 +92,71 @@ class SummarizeEngine(
         // Derive the Bullets and Detailed views (as desktop did up front).
         _progress.value = Progress("deriving")
         val bullets = Cleaner.clean(streamCollect(Prompts.BULLETS, normal))
-        // Detailed is built from the richest material available: for short
-        // sources the source itself; for long sources the section notes feed it.
-        val detailedSource = if (text.length <= singlePassLimit) text else normal
+        // Detailed should be genuinely more in-depth than Normal. On the cloud
+        // engine (big context) we feed it the FULL source so it can add real
+        // depth; on-device we fall back to section notes for very long sources.
+        val detailedSource = when {
+            text.length <= singlePassLimit -> text
+            bigContext -> text          // Groq: use the whole source for depth
+            else -> normal              // on-device: can't fit the whole thing
+        }
         val detailed = Cleaner.clean(buildDetailed(detailedSource))
 
         _progress.value = Progress("done")
         return Result(normal, detailed, bullets, title, kind, approxMinutes)
     }
 
-    // ── stages ──────────────────────────────────────────────────────────────────
+    /**
+     * Per-chapter summary for EPUBs. Produces a one-line whole-book overview at
+     * the top, then a short summary under each chapter title. Returned as Markdown
+     * for the Chapter view. Runs after the main summary so the overview can reuse
+     * the finished [bookOverview] (the Normal summary's gist line).
+     */
+    suspend fun summarizeChapters(
+        chapters: List<ai.sonario.app.source.FileTextExtractor.Chapter>,
+        bookOverview: String,
+    ): String {
+        if (chapters.isEmpty()) return ""
+        val sb = StringBuilder()
+        val gist = bookOverview.lineSequence()
+            .map { it.trim().removePrefix("**").removeSuffix("**").trim() }
+            .firstOrNull { it.isNotBlank() && !it.startsWith("#") }
+            ?.take(300)
+        if (!gist.isNullOrBlank()) sb.append("**$gist**\n\n")
+        chapters.forEachIndexed { i, ch ->
+            _progress.value = Progress("chapters", i + 1, chapters.size)
+            val summary = runCatching {
+                Cleaner.clean(streamCollect(Prompts.CHAPTER, source(ch.text), maxTokens = 300))
+            }.getOrDefault("")
+            sb.append("## ${ch.title}\n\n")
+            sb.append(if (summary.isNotBlank()) summary else "(Couldn't summarize this chapter.)")
+            sb.append("\n\n")
+        }
+        return sb.toString().trimEnd()
+    }
 
+    /**
+     * Answer a question grounded in the source text, with inline [n] citations.
+     * The source is chunked into numbered excerpts so the model can cite them;
+     * for very long sources we cap how much is sent (cloud can take a lot).
+     */
+    suspend fun answer(question: String, sourceText: String): String {
+        _progress.value = Progress("answering", 0, 1)
+        val cap = if (bigContext) 100_000 else 8_000
+        val material = if (sourceText.length > cap) sourceText.substring(0, cap) else sourceText
+        // Number excerpts so citations map to real chunks of the source.
+        val excerptSize = if (bigContext) 2000 else 1200
+        val excerpts = chunkText(material, excerptSize)
+        val numbered = excerpts.mapIndexed { i, e -> "[${i + 1}] $e" }.joinToString("\n\n")
+        val user = "Source excerpts:\n\n$numbered\n\nQuestion: $question"
+        val ans = runCatching {
+            Cleaner.clean(streamCollect(Prompts.ASK, user, maxTokens = if (bigContext) 1200 else 700))
+        }.getOrDefault("Sorry, I couldn't answer that from the source.")
+        _progress.value = Progress("done")
+        return ans
+    }
+
+    // ── stages ──────────────────────────────────────────────────────────────────
     /** pipeline._final_combine, simplified: one-shot, else hierarchical batches. */
     private suspend fun finalCombine(joined: String): String {
         // 1) one-shot
@@ -128,11 +183,17 @@ class SummarizeEngine(
 
     /** pipeline._build_detailed: single pass when it fits, else batch then merge. */
     private suspend fun buildDetailed(src: String): String {
+        // Detailed wants real length. Give the cloud engine a large output budget
+        // (~2 full pages); on-device stays modest so it doesn't run for ages.
+        val onePassCap = if (bigContext) 4000 else 1600
+        val chunkCap = if (bigContext) 3000 else 1200
         if (src.length <= singlePassLimit * 2) {
-            return streamCollect(Prompts.DETAILED, source(src), maxTokens = 1600)
+            return streamCollect(Prompts.DETAILED, source(src), maxTokens = onePassCap)
         }
         val chunks = chunkTextCapped(src)
-        val parts = chunks.map { streamCollect(Prompts.DETAILED, source(it), maxTokens = 1200) }
+        val parts = chunks.map {
+            streamCollect(Prompts.DETAILED, source(it), maxTokens = chunkCap)
+        }
         return parts.joinToString("\n\n")
     }
 

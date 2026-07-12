@@ -26,8 +26,9 @@ object Prompts {
         "Then 3 to 6 thematic sections, each with its own '## ' sub-headline named " +
         "for the actual topic. Do NOT use generic headers like 'Summary' or " +
         "'Key Points'. Under each sub-headline, prefer bullet points with a " +
-        "**bold lead-in phrase** then a short explanation, and a compact Markdown " +
-        "table when the content compares items or lists options/steps/types.\n\n" +
+        "**bold lead-in phrase** then a short explanation. When comparing items " +
+        "or listing options/steps/types, use a nested bulleted list, never a " +
+        "Markdown table (tables don't render well on a phone).\n\n" +
         "## Takeaway\nOne or two sentences on the core 'so what'.\n\n" +
         "Be faithful to the source; never invent facts. If it is a video transcript, " +
         "summarize what is said, not the act of speaking. Keep it tight and scannable."
@@ -50,26 +51,47 @@ object Prompts {
         "Then 4 to 7 thematic sections, each with its own '## ' sub-headline named for " +
         "the actual topic (not generic labels like 'Summary' or 'Key Points'). Under " +
         "each, prefer bullet points with a **bold lead-in phrase** plus a short " +
-        "explanation, and use a compact Markdown table whenever the material compares " +
-        "items or lists options/steps/types/examples.\n\n" +
+        "explanation. When the material compares items or lists options/steps/types/" +
+        "examples, use a nested bulleted list, never a Markdown table (tables don't " +
+        "render well on a phone).\n\n" +
         "## Takeaway\nOne or two sentences on the core message.\n\n" +
         "Synthesize across ALL sections, not just the first. Be faithful; never invent. " +
         "Keep it tight and scannable." + NO_STYLE)
 
-    /** Thorough two-page prose view. (DETAILED_SUMMARY_SYSTEM) */
+    /** Thorough multi-page prose view. (DETAILED_SUMMARY_SYSTEM) */
     val DETAILED = (
         "You write a THOROUGH, in-depth prose summary of a document, long article, or " +
-        "long video transcript. This is the 'Detailed' view: the reader wants real " +
-        "depth and nuance, not a quick skim. Aim for roughly TWO FULL PAGES or more " +
-        "for substantial sources. Do not compress aggressively, and do not omit " +
-        "important supporting detail, examples, names, numbers, or step-by-step " +
-        "reasoning that appears in the source.\n\n" +
-        "Write in clear, well-organized PROSE (flowing paragraphs), not bullet lists. " +
-        "Use '## ' sub-headlines named for the actual topics. Start with one bold " +
+        "long video transcript. This is the 'Detailed' view: the reader wants maximum " +
+        "depth, nuance, and completeness, NOT a quick skim and NOT the same length as " +
+        "a short summary. Be expansive. Aim for at least 700-1000 words for a " +
+        "substantial source, longer if the material supports it. Do not compress; do " +
+        "not omit important supporting detail, examples, names, dates, numbers, " +
+        "quotes, caveats, or step-by-step reasoning that appears in the source. Where " +
+        "the source explains WHY or HOW something works, preserve that reasoning in " +
+        "full rather than collapsing it to a single line.\n\n" +
+        "Write in clear, well-organized PROSE (flowing multi-sentence paragraphs), not " +
+        "bullet lists. Use several '## ' sub-headlines named for the actual topics, and " +
+        "develop each section across multiple full paragraphs. Start with one bold " +
         "sentence giving the overall thesis, then an '## Overview' paragraph, then the " +
-        "detailed sections, and end with a '## Bottom line' paragraph. Be faithful to " +
-        "the source; never invent facts. If it is a transcript, summarize what is said, " +
-        "not the act of speaking." + NO_STYLE)
+        "detailed sections (as many as the material warrants), and end with a " +
+        "'## Bottom line' paragraph. Be faithful to the source; never invent facts. If " +
+        "it is a transcript, summarize what is said, not the act of speaking." + NO_STYLE)
+
+    /** Short per-chapter summary for the EPUB Chapter view. (CHAPTER_SYSTEM) */
+    val CHAPTER = (
+        "Summarize this single chapter of a book in 2 to 4 sentences of plain prose. " +
+        "Capture what actually happens or what the chapter argues, including key names " +
+        "and specifics. Do not add a header or the chapter title (it is shown " +
+        "separately). Be faithful; do not invent. Output only the summary." + NO_STYLE)
+
+    /** Answer a question grounded in the source, with citations. (ASK_SYSTEM) */
+    val ASK = (
+        "You answer the user's question using ONLY the provided source material. The " +
+        "source is split into numbered excerpts like [1], [2]. Write a clear, direct " +
+        "answer in a sentence or two, or a short paragraph. After each claim that " +
+        "comes from the source, cite the excerpt number(s) in square brackets, e.g. " +
+        "'The author argues X [3].' If the source does not contain the answer, say so " +
+        "plainly rather than guessing. Do not invent facts not in the source." + NO_STYLE)
 
     /** Plain bulleted outline derived from a finished summary. (BULLETS_SYSTEM) */
     val BULLETS = (

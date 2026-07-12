@@ -1,6 +1,7 @@
 package ai.sonario.app
 
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -29,6 +30,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val shared = readSharedText(intent)
         val lastCrash = CrashReporter.consumeLastCrash(this)
+        maybeRequestNotifications()
 
         setContent {
             SonarioTheme {
@@ -43,6 +45,47 @@ class MainActivity : ComponentActivity() {
                 val vm: SummaryViewModel = viewModel()
                 val uiState by vm.ui.collectAsState()
                 var screen by remember { mutableStateOf(Screen.SUMMARY) }
+
+                // Export: watch for a requested export, open the system file
+                // picker (ACTION_CREATE_DOCUMENT), then write the file.
+                val pending by vm.pendingExport.collectAsState()
+                val context = androidx.compose.ui.platform.LocalContext.current
+                val exportLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+                    androidx.activity.result.contract.ActivityResultContracts.CreateDocument(
+                        "*/*")
+                ) { uri ->
+                    val p = pending
+                    if (uri != null && p != null) {
+                        runCatching {
+                            ai.sonario.app.data.Exporter.write(
+                                context, uri, p.format, p.title, p.body)
+                        }
+                    }
+                    vm.clearPendingExport()
+                }
+                LaunchedEffect(pending) {
+                    val p = pending ?: return@LaunchedEffect
+                    exportLauncher.launch(
+                        ai.sonario.app.data.Exporter.suggestedName(p.title, p.format))
+                }
+
+                // Local file picker: open the system browser and hand the Uri back.
+                val wantFile by vm.pickFile.collectAsState()
+                val openLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+                    androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+                ) { uri ->
+                    if (uri != null) vm.onFilePicked(uri) else vm.clearPickFile()
+                }
+                LaunchedEffect(wantFile) {
+                    if (wantFile) {
+                        // Any document type; the extractor sniffs by extension.
+                        openLauncher.launch(arrayOf(
+                            "text/*", "application/pdf", "application/epub+zip",
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            "*/*",
+                        ))
+                    }
+                }
 
                 // Pre-fill from a shared link (e.g. Share from YouTube).
                 LaunchedEffect(shared) {
@@ -74,6 +117,18 @@ class MainActivity : ComponentActivity() {
                         onOpenSettings = { screen = Screen.SETTINGS },
                     )
                 }
+            }
+        }
+    }
+
+    private fun maybeRequestNotifications() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = checkSelfPermission(
+                android.Manifest.permission.POST_NOTIFICATIONS) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                requestPermissions(
+                    arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
             }
         }
     }

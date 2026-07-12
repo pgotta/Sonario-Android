@@ -57,6 +57,45 @@ class RateLimiter(context: Context) {
 
     fun dailyUsage(): DailyUsage = DailyUsage(dailyUsed(), tpdLimit)
 
+    /**
+     * A pre-flight estimate for summarizing [sourceText]. Accounts for the fact
+     * that map-reduce sends the text once for condensing plus a smaller combine
+     * pass, so total tokens are a bit more than the raw input.
+     */
+    data class Estimate(
+        val inputTokens: Long,
+        val totalTokens: Long,
+        val dailyRemaining: Long,
+        val dailyLimit: Long,
+        val exceedsDaily: Boolean,
+        val etaSeconds: Long,
+    ) {
+        val percentOfRemaining: Int =
+            if (dailyRemaining > 0)
+                ((totalTokens.toDouble() / dailyRemaining) * 100).toInt().coerceIn(0, 999)
+            else 100
+    }
+
+    fun estimate(sourceText: String): Estimate {
+        val input = estimateTokens(sourceText)
+        // Map-reduce overhead: prompts on each chunk + a combine pass + output.
+        // Empirically ~1.3x the input plus generated summary tokens.
+        val total = (input * 1.3).toLong() + 1200
+        val remaining = dailyUsage().remaining
+        // ETA is dominated by per-minute pacing: how many minute-windows the
+        // total spans at tpmLimit, plus a little for actual generation.
+        val minutes = (total.toDouble() / tpmLimit)
+        val etaSec = (minutes * 60).toLong().coerceAtLeast(2) + 4
+        return Estimate(
+            inputTokens = input,
+            totalTokens = total,
+            dailyRemaining = remaining,
+            dailyLimit = tpdLimit,
+            exceedsDaily = total > remaining,
+            etaSeconds = etaSec,
+        )
+    }
+
     /** True if this many tokens would blow the daily cap (can't be waited out). */
     fun wouldExceedDaily(tokens: Long): Boolean = dailyUsed() + tokens > tpdLimit
 

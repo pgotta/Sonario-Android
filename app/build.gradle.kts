@@ -12,8 +12,8 @@ android {
         applicationId = "ai.sonario.app"
         minSdk = 28          // Android 9. 8 Elite phones are far above this.
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.1.1"
+        versionCode = 1
+        versionName = "1.1.0"
         vectorDrawables { useSupportLibrary = true }
         ndk { abiFilters += "arm64-v8a" }  // modern phones; keeps APK lean
     }
@@ -49,6 +49,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.activity:activity-compose:1.9.2")
+    implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
     implementation("androidx.navigation:navigation-compose:2.8.1")
@@ -57,6 +58,9 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // HTML parsing for web-article extraction (the Jsoup analogue of BeautifulSoup)
     implementation("org.jsoup:jsoup:1.18.1")
+
+    // PDF text extraction for the local-file picker.
+    implementation("com.tom-roush:pdfbox-android:2.0.27.0")
 
     // Markdown rendering for the summary view (core + Material 3 module).
     implementation("com.mikepenz:multiplatform-markdown-renderer:0.27.0")

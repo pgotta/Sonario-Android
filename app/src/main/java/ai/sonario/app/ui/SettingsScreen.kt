@@ -88,6 +88,20 @@ fun SettingsScreen(vm: SummaryViewModel, onBack: () -> Unit) {
                 Text("Key saved: ${vm.currentGroqKeyMasked()}",
                     color = SonarioColors.Green,
                     style = MaterialTheme.typography.labelLarge)
+                Spacer(Modifier.height(6.dp))
+                val (used, limit) = vm.groqDailyUsage()
+                val remaining = (limit - used).coerceAtLeast(0)
+                val pct = if (limit > 0) (remaining * 100 / limit).toInt() else 0
+                Text(
+                    "Daily budget: $pct% remaining " +
+                    "(~${fmtK(remaining)} of ${fmtK(limit)} tokens left today)",
+                    color = if (pct < 15) SonarioColors.Teal else SonarioColors.Muted,
+                    style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "Counts usage through this app only; resets daily. Groq's free " +
+                    "tier is about ${fmtK(limit)} tokens/day.",
+                    color = SonarioColors.Muted,
+                    style = MaterialTheme.typography.bodySmall)
                 Spacer(Modifier.height(8.dp))
             }
 
@@ -184,3 +198,10 @@ private fun EngineOption(
     }
 }
 
+
+/** Compact token count: 480000 -> "480K", 1200000 -> "1.2M". */
+private fun fmtK(n: Long): String = when {
+    n >= 1_000_000 -> String.format("%.1fM", n / 1_000_000.0)
+    n >= 1_000 -> "${n / 1000}K"
+    else -> n.toString()
+}

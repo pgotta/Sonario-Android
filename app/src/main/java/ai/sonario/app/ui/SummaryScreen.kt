@@ -2,6 +2,13 @@ package ai.sonario.app.ui
 
 import ai.sonario.app.R
 import ai.sonario.app.data.EngineChoice
+import ai.sonario.app.data.Exporter
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import ai.sonario.app.summarize.SummarizeEngine
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
@@ -13,6 +20,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.*
@@ -184,6 +193,26 @@ private fun InputCard(ui: UiState, vm: SummaryViewModel) {
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
                 colors = sonarioFieldColors(),
             )
+            Spacer(Modifier.height(8.dp))
+            // Or pick a local document (PDF, EPUB, DOCX, TXT, MD).
+            Surface(
+                color = SonarioColors.Panel2,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth(),
+                onClick = { vm.requestPickFile() },
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.FolderOpen, contentDescription = null,
+                        tint = SonarioColors.Green, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Text("Choose a file  (PDF, EPUB, DOCX, TXT, MD)",
+                        color = SonarioColors.InkSoft,
+                        style = MaterialTheme.typography.bodyMedium)
+                }
+            }
             Spacer(Modifier.height(10.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 AssistChip(
@@ -234,10 +263,20 @@ private fun ProgressCard(ui: UiState) {
                 "condensing" -> "Condensing section ${ui.progressCurrent} of ${ui.progressTotal}"
                 "synthesizing" -> "Writing the summary"
                 "deriving" -> "Building bullets and detailed view"
+                "chapters" -> "Summarizing chapters ${ui.progressCurrent} of ${ui.progressTotal}"
+                "reading file" -> "Reading file"
+                "answering" -> "Finding the answer"
                 else -> "Working"
             }
             Text(label, color = SonarioColors.InkSoft,
                 style = MaterialTheme.typography.labelLarge)
+
+            if (ui.estimateText.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Text(ui.estimateText,
+                    color = SonarioColors.Muted,
+                    style = MaterialTheme.typography.bodyMedium)
+            }
 
             if (ui.rateWaitSeconds > 0) {
                 Spacer(Modifier.height(6.dp))
@@ -306,7 +345,62 @@ private fun ResultArea(
             modifier = Modifier.padding(top = 2.dp, bottom = 14.dp))
 
         // Normal / Detailed / Bullets toggle (default Normal), matching desktop.
-        ViewToggle(view, vm)
+        ViewToggle(view, vm, hasChapters = res.chapters.isNotBlank())
+
+        val md = when (view) {
+            SummaryView.NORMAL -> res.normal
+            SummaryView.DETAILED -> res.detailed
+            SummaryView.BULLETS -> res.bullets
+            SummaryView.CHAPTER -> res.chapters
+        }
+
+        // Actions: copy all + export to a file.
+        Spacer(Modifier.height(12.dp))
+        val clipboard = LocalClipboardManager.current
+        var showExport by remember { mutableStateOf(false) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(
+                onClick = { clipboard.setText(AnnotatedString(md)) },
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = SonarioColors.InkSoft),
+            ) {
+                Icon(Icons.Filled.ContentCopy, contentDescription = null,
+                    modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Copy all")
+            }
+            Spacer(Modifier.width(10.dp))
+            Box {
+                Button(
+                    onClick = { showExport = true },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SonarioColors.Green,
+                        contentColor = SonarioColors.Abyss),
+                ) {
+                    Icon(Icons.Filled.Download, contentDescription = null,
+                        modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Export")
+                }
+                DropdownMenu(
+                    expanded = showExport,
+                    onDismissRequest = { showExport = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Save as PDF") },
+                        onClick = { showExport = false
+                            vm.requestExport(Exporter.Format.PDF, res.title, md) })
+                    DropdownMenuItem(
+                        text = { Text("Save as Markdown (.md)") },
+                        onClick = { showExport = false
+                            vm.requestExport(Exporter.Format.MD, res.title, md) })
+                    DropdownMenuItem(
+                        text = { Text("Save as text (.txt)") },
+                        onClick = { showExport = false
+                            vm.requestExport(Exporter.Format.TXT, res.title, md) })
+                }
+            }
+        }
 
         Spacer(Modifier.height(14.dp))
         Surface(
@@ -314,45 +408,45 @@ private fun ResultArea(
             shape = RoundedCornerShape(16.dp),
             modifier = Modifier.fillMaxWidth(),
         ) {
-            val md = when (view) {
-                SummaryView.NORMAL -> res.normal
-                SummaryView.DETAILED -> res.detailed
-                SummaryView.BULLETS -> res.bullets
-            }
             Box(Modifier.padding(16.dp)) {
-                Markdown(
-                    content = md,
-                    colors = markdownColor(
-                        text = SonarioColors.Ink,
-                        linkText = SonarioColors.Green,
-                    ),
-                    typography = markdownTypography(
-                        // Section headers: smaller, semibold, Sonario green,
-                        // instead of the library's default huge white text.
-                        h1 = MaterialTheme.typography.titleLarge.copy(
-                            color = SonarioColors.Green,
-                            fontWeight = FontWeight.SemiBold),
-                        h2 = MaterialTheme.typography.titleMedium.copy(
-                            color = SonarioColors.Green,
-                            fontWeight = FontWeight.SemiBold),
-                        h3 = MaterialTheme.typography.titleSmall.copy(
-                            color = SonarioColors.Green,
-                            fontWeight = FontWeight.SemiBold),
-                        h4 = MaterialTheme.typography.labelLarge.copy(
-                            color = SonarioColors.Green,
-                            fontWeight = FontWeight.SemiBold),
-                        h5 = MaterialTheme.typography.labelLarge.copy(
-                            color = SonarioColors.Green),
-                        h6 = MaterialTheme.typography.labelLarge.copy(
-                            color = SonarioColors.Green),
-                        text = MaterialTheme.typography.bodyLarge.copy(
-                            color = SonarioColors.Ink),
-                        paragraph = MaterialTheme.typography.bodyLarge.copy(
-                            color = SonarioColors.Ink),
-                    ),
-                )
+                SelectionContainer {
+                    Markdown(
+                        content = md,
+                        colors = markdownColor(
+                            text = SonarioColors.Ink,
+                            linkText = SonarioColors.Green,
+                        ),
+                        typography = markdownTypography(
+                            // Section headers: smaller, semibold, Sonario green,
+                            // instead of the library's default huge white text.
+                            h1 = MaterialTheme.typography.titleLarge.copy(
+                                color = SonarioColors.Green,
+                                fontWeight = FontWeight.SemiBold),
+                            h2 = MaterialTheme.typography.titleMedium.copy(
+                                color = SonarioColors.Green,
+                                fontWeight = FontWeight.SemiBold),
+                            h3 = MaterialTheme.typography.titleSmall.copy(
+                                color = SonarioColors.Green,
+                                fontWeight = FontWeight.SemiBold),
+                            h4 = MaterialTheme.typography.labelLarge.copy(
+                                color = SonarioColors.Green,
+                                fontWeight = FontWeight.SemiBold),
+                            h5 = MaterialTheme.typography.labelLarge.copy(
+                                color = SonarioColors.Green),
+                            h6 = MaterialTheme.typography.labelLarge.copy(
+                                color = SonarioColors.Green),
+                            text = MaterialTheme.typography.bodyLarge.copy(
+                                color = SonarioColors.Ink),
+                            paragraph = MaterialTheme.typography.bodyLarge.copy(
+                                color = SonarioColors.Ink),
+                        ),
+                    )
+                }
             }
         }
+
+        Spacer(Modifier.height(16.dp))
+        AskBox(vm)
 
         Spacer(Modifier.height(16.dp))
         OutlinedButton(
@@ -364,13 +458,75 @@ private fun ResultArea(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ViewToggle(view: SummaryView, vm: SummaryViewModel) {
-    val options = listOf(
-        SummaryView.NORMAL to "Normal",
-        SummaryView.DETAILED to "Detailed",
-        SummaryView.BULLETS to "Bullets",
-    )
+private fun AskBox(vm: SummaryViewModel) {
+    val ui by vm.ui.collectAsState()
+    var question by remember { mutableStateOf("") }
+
+    Surface(
+        color = SonarioColors.Panel,
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text("Ask about this", color = SonarioColors.InkSoft,
+                style = MaterialTheme.typography.labelLarge)
+            Spacer(Modifier.height(8.dp))
+
+            // Prior Q&A pairs.
+            ui.qaHistory.forEach { qa ->
+                Text(qa.question, color = SonarioColors.Green,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(4.dp))
+                SelectionContainer {
+                    Markdown(
+                        content = qa.answer,
+                        colors = markdownColor(
+                            text = SonarioColors.Ink, linkText = SonarioColors.Green),
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+
+            OutlinedTextField(
+                value = question,
+                onValueChange = { question = it },
+                placeholder = { Text("Ask a question about the source") },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !ui.asking,
+                colors = sonarioFieldColors(),
+            )
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = { vm.ask(question); question = "" },
+                enabled = !ui.asking && question.isNotBlank(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = SonarioColors.Green,
+                    contentColor = SonarioColors.Abyss),
+            ) {
+                if (ui.asking) {
+                    Text("Thinking…")
+                } else {
+                    Icon(Icons.Filled.AutoAwesome, contentDescription = null,
+                        modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Ask")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ViewToggle(view: SummaryView, vm: SummaryViewModel, hasChapters: Boolean) {
+    val options = buildList {
+        add(SummaryView.NORMAL to "Normal")
+        add(SummaryView.DETAILED to "Detailed")
+        add(SummaryView.BULLETS to "Bullets")
+        if (hasChapters) add(SummaryView.CHAPTER to "Chapter")
+    }
     Row(
         Modifier
             .fillMaxWidth()
@@ -391,7 +547,8 @@ private fun ViewToggle(view: SummaryView, vm: SummaryViewModel) {
             ) {
                 Text(label,
                     color = if (selected) SonarioColors.Abyss else SonarioColors.InkSoft,
-                    style = MaterialTheme.typography.labelLarge)
+                    style = MaterialTheme.typography.labelLarge,
+                    maxLines = 1)
             }
         }
     }
