@@ -37,20 +37,25 @@ resources" errors.
 
 **Build -> Build APK(s)**. Output: `app/build/outputs/apk/debug/app-debug.apk`.
 
-Install: because this project replaces an older broken extractor, uninstall the
-existing Sonario app from the phone first, then connect the phone with USB
-debugging on and press **Run**. You can also use:
+Install: because this project replaces an older broken extractor, connect the phone with USB debugging on and press **Run**. To preserve the
+existing app data, install the new APK over the current build. For a clean install
+only, use:
 
 ```text
+# Clean install (erases Sonario settings, models, and saved sessions)
 adb uninstall ai.sonario.app
 adb install app/build/outputs/apk/debug/app-debug.apk
+
+# Normal upgrade that preserves app data
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-This build is **version 1.1.0 (versionCode 2)** and Settings shows **YouTube
-extractor 2**. That marker prevents accidentally testing an old cached APK. An
-uninstall removes locally downloaded models and saved settings, so save your Groq
-key first if needed. You can rename the APK to `Sonario.apk` before sharing; the
-filename does not affect the installed app.
+This repository is **version 1.3.3 (versionCode 9)**. When upgrading from an
+older Sonario build signed with the same key, install over the existing app so
+Groq settings, downloaded models, and saved sessions remain intact. Uninstall
+only when Android reports a signing conflict or the installation is otherwise
+corrupted; uninstalling erases the app's private data. You can rename the APK to
+`Sonario.apk` before sharing; the filename does not affect the installed app.
 
 ## 3. First launch and engine setup
 

@@ -58,6 +58,16 @@ class RateLimiter(context: Context) {
     fun dailyUsage(): DailyUsage = DailyUsage(dailyUsed(), tpdLimit)
 
     /**
+     * Reset the daily counter. Call when the API key changes: a different key has
+     * its own separate daily budget on Groq's side, so the old key's tally no
+     * longer applies.
+     */
+    fun resetDaily() {
+        prefs.edit().putString("day", today()).putLong("used", 0).apply()
+        window.clear()
+    }
+
+    /**
      * A pre-flight estimate for summarizing [sourceText]. Accounts for the fact
      * that map-reduce sends the text once for condensing plus a smaller combine
      * pass, so total tokens are a bit more than the raw input.

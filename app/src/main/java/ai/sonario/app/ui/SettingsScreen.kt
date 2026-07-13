@@ -102,6 +102,10 @@ fun SettingsScreen(vm: SummaryViewModel, onBack: () -> Unit) {
                     "tier is about ${fmtK(limit)} tokens/day.",
                     color = SonarioColors.Muted,
                     style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.height(4.dp))
+                TextButton(onClick = { vm.resetDailyBudget() }) {
+                    Text("Reset counter", color = SonarioColors.Green)
+                }
                 Spacer(Modifier.height(8.dp))
             }
 
@@ -158,7 +162,7 @@ fun SettingsScreen(vm: SummaryViewModel, onBack: () -> Unit) {
             HorizontalDivider(color = SonarioColors.RuleSoft)
             Spacer(Modifier.height(12.dp))
             Text(
-                "Sonario 1.1.0 • YouTube extractor 2",
+                "Sonario 1.3.3 • keyboard-safe Ask field",
                 color = SonarioColors.Muted,
                 style = MaterialTheme.typography.bodySmall,
             )

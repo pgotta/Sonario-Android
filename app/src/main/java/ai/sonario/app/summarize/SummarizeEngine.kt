@@ -4,6 +4,7 @@ import ai.sonario.app.llm.InferenceEngine
 import ai.sonario.app.llm.ModelInfo
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collect
 
 /**
  * The four-stage summarizer, ported from pipeline.summarize_text.
@@ -52,6 +53,19 @@ class SummarizeEngine(
         val chapters: String = "",   // per-chapter EPUB summary, empty if N/A
     )
 
+    /**
+     * Durable stage output. Saving this after each completed model call means a
+     * killed activity/process can resume without paying for finished chunks again.
+     */
+    data class Checkpoint(
+        val notes: List<String> = emptyList(),
+        val normal: String = "",
+        val bullets: String = "",
+        val detailed: String = "",
+        val detailedParts: List<String> = emptyList(),
+        val chapterParts: List<String> = emptyList(),
+    )
+
     private val _progress = MutableStateFlow(Progress("idle"))
     val progress: StateFlow<Progress> = _progress
 
@@ -61,46 +75,71 @@ class SummarizeEngine(
         title: String,
         kind: String,
         approxMinutes: Int?,
+        initialCheckpoint: Checkpoint = Checkpoint(),
+        onCheckpoint: suspend (Checkpoint) -> Unit = {},
     ): Result {
         engine.ensureReady(model)
+        var checkpoint = initialCheckpoint
 
         val normal: String
-        if (text.length <= singlePassLimit) {
-            // Single pass — the small/short path.
+        if (checkpoint.normal.isNotBlank()) {
+            normal = checkpoint.normal
+        } else if (text.length <= singlePassLimit) {
+            // Single pass — at worst this one call is repeated after an interruption.
             _progress.value = Progress("synthesizing", 1, 1)
             normal = Cleaner.clean(streamCollect(Prompts.SUMMARY, source(text)))
+            checkpoint = checkpoint.copy(normal = normal)
+            onCheckpoint(checkpoint)
         } else {
-            // Map: chunk and condense each section, but bounded.
-            // Choose a chunk size that keeps us under maxChunks. For very large
-            // sources this means each chunk grows (up to maxChunkChars); if even
-            // that isn't enough, we cap the material processed so a job can't run
-            // for hours on-device.
+            // Resume the map stage at the first unfinished chunk.
             val chunks = chunkTextCapped(text)
-            _progress.value = Progress("condensing", 0, chunks.size)
-            val notes = ArrayList<String>(chunks.size)
-            chunks.forEachIndexed { i, chunk ->
-                val note = streamCollect(Prompts.CHUNK, chunk)
+            val notes = checkpoint.notes.take(chunks.size).toMutableList()
+            _progress.value = Progress("condensing", notes.size, chunks.size)
+            for (i in notes.size until chunks.size) {
+                val note = streamCollect(Prompts.CHUNK, chunks[i])
                 notes.add(Cleaner.clean(note))
+                checkpoint = checkpoint.copy(notes = notes.toList())
+                onCheckpoint(checkpoint)
                 _progress.value = Progress("condensing", i + 1, chunks.size)
             }
-            // Reduce: combine the section notes into the final one-page summary.
+
             _progress.value = Progress("synthesizing", chunks.size, chunks.size)
             val joined = notes.joinToString("\n\n")
             normal = Cleaner.clean(finalCombine(joined))
+            checkpoint = checkpoint.copy(normal = normal, notes = notes.toList())
+            onCheckpoint(checkpoint)
         }
 
-        // Derive the Bullets and Detailed views (as desktop did up front).
         _progress.value = Progress("deriving")
-        val bullets = Cleaner.clean(streamCollect(Prompts.BULLETS, normal))
-        // Detailed should be genuinely more in-depth than Normal. On the cloud
-        // engine (big context) we feed it the FULL source so it can add real
-        // depth; on-device we fall back to section notes for very long sources.
+        val bullets = if (checkpoint.bullets.isNotBlank()) {
+            checkpoint.bullets
+        } else {
+            Cleaner.clean(streamCollect(Prompts.BULLETS, normal)).also {
+                checkpoint = checkpoint.copy(bullets = it)
+                onCheckpoint(checkpoint)
+            }
+        }
+
         val detailedSource = when {
             text.length <= singlePassLimit -> text
-            bigContext -> text          // Groq: use the whole source for depth
-            else -> normal              // on-device: can't fit the whole thing
+            bigContext -> text
+            else -> normal
         }
-        val detailed = Cleaner.clean(buildDetailed(detailedSource))
+        val detailed = if (checkpoint.detailed.isNotBlank()) {
+            checkpoint.detailed
+        } else {
+            buildDetailed(
+                src = detailedSource,
+                existingParts = checkpoint.detailedParts,
+                onParts = { parts ->
+                    checkpoint = checkpoint.copy(detailedParts = parts)
+                    onCheckpoint(checkpoint)
+                },
+            ).also {
+                checkpoint = checkpoint.copy(detailed = it)
+                onCheckpoint(checkpoint)
+            }
+        }
 
         _progress.value = Progress("done")
         return Result(normal, detailed, bullets, title, kind, approxMinutes)
@@ -115,23 +154,32 @@ class SummarizeEngine(
     suspend fun summarizeChapters(
         chapters: List<ai.sonario.app.source.FileTextExtractor.Chapter>,
         bookOverview: String,
+        existingParts: List<String> = emptyList(),
+        onCheckpoint: suspend (List<String>) -> Unit = {},
     ): String {
         if (chapters.isEmpty()) return ""
+        val parts = existingParts.take(chapters.size).toMutableList()
+        for (i in parts.size until chapters.size) {
+            val ch = chapters[i]
+            _progress.value = Progress("chapters", i + 1, chapters.size)
+            val summary = runCatching {
+                Cleaner.clean(streamCollect(Prompts.CHAPTER, source(ch.text), maxTokens = 300))
+            }.getOrDefault("")
+            val section = buildString {
+                append("## ${ch.title}\n\n")
+                append(if (summary.isNotBlank()) summary else "(Couldn't summarize this chapter.)")
+            }
+            parts.add(section)
+            onCheckpoint(parts.toList())
+        }
+
         val sb = StringBuilder()
         val gist = bookOverview.lineSequence()
             .map { it.trim().removePrefix("**").removeSuffix("**").trim() }
             .firstOrNull { it.isNotBlank() && !it.startsWith("#") }
             ?.take(300)
         if (!gist.isNullOrBlank()) sb.append("**$gist**\n\n")
-        chapters.forEachIndexed { i, ch ->
-            _progress.value = Progress("chapters", i + 1, chapters.size)
-            val summary = runCatching {
-                Cleaner.clean(streamCollect(Prompts.CHAPTER, source(ch.text), maxTokens = 300))
-            }.getOrDefault("")
-            sb.append("## ${ch.title}\n\n")
-            sb.append(if (summary.isNotBlank()) summary else "(Couldn't summarize this chapter.)")
-            sb.append("\n\n")
-        }
+        sb.append(parts.joinToString("\n\n"))
         return sb.toString().trimEnd()
     }
 
@@ -142,18 +190,90 @@ class SummarizeEngine(
      */
     suspend fun answer(question: String, sourceText: String): String {
         _progress.value = Progress("answering", 0, 1)
-        val cap = if (bigContext) 100_000 else 8_000
-        val material = if (sourceText.length > cap) sourceText.substring(0, cap) else sourceText
-        // Number excerpts so citations map to real chunks of the source.
-        val excerptSize = if (bigContext) 2000 else 1200
-        val excerpts = chunkText(material, excerptSize)
-        val numbered = excerpts.mapIndexed { i, e -> "[${i + 1}] $e" }.joinToString("\n\n")
+
+        // Do not blindly send only the beginning of a long video/book. Select the
+        // passages most relevant to the question from across the entire source,
+        // while keeping the prompt comfortably inside the model context window.
+        val excerpts = selectRelevantExcerpts(question, sourceText)
+        val numbered = excerpts.mapIndexed { i, excerpt ->
+            "[${i + 1}] $excerpt"
+        }.joinToString("\n\n")
         val user = "Source excerpts:\n\n$numbered\n\nQuestion: $question"
-        val ans = runCatching {
-            Cleaner.clean(streamCollect(Prompts.ASK, user, maxTokens = if (bigContext) 1200 else 700))
-        }.getOrDefault("Sorry, I couldn't answer that from the source.")
+
+        val answer = Cleaner.clean(
+            streamCollect(
+                Prompts.ASK,
+                user,
+                maxTokens = if (bigContext) 1200 else 700,
+            )
+        )
         _progress.value = Progress("done")
-        return ans
+        if (answer.isBlank()) {
+            throw IllegalStateException("The model returned an empty answer.")
+        }
+        return answer
+    }
+
+    private fun selectRelevantExcerpts(question: String, sourceText: String): List<String> {
+        val excerptSize = if (bigContext) 1800 else 1000
+        val maxExcerpts = if (bigContext) 30 else 6
+        val all = chunkText(sourceText, excerptSize)
+        if (all.isEmpty()) return listOf(sourceText.take(excerptSize))
+        if (all.size <= maxExcerpts) return all
+
+        val terms = WORD_REGEX.findAll(question.lowercase())
+            .map { it.value }
+            .filter { it.length >= 3 && it !in ASK_STOP_WORDS }
+            .distinct()
+            .toList()
+
+        // With no useful keywords, use evenly spaced coverage rather than only the
+        // start of the source.
+        if (terms.isEmpty()) {
+            return evenlySpaced(all, maxExcerpts)
+        }
+
+        val scored = all.mapIndexed { index, chunk ->
+            val lower = chunk.lowercase()
+            var score = 0.0
+            for (term in terms) {
+                var from = 0
+                var occurrences = 0
+                while (true) {
+                    val found = lower.indexOf(term, from)
+                    if (found < 0) break
+                    occurrences++
+                    from = found + term.length
+                }
+                score += occurrences * (1.0 + (term.length.coerceAtMost(10) / 10.0))
+            }
+            // Small coverage bonuses prevent all excerpts from clustering around
+            // one repeated phrase and preserve some beginning/end context.
+            if (index == 0 || index == all.lastIndex) score += 0.35
+            Triple(index, chunk, score)
+        }
+
+        val top = scored
+            .sortedWith(compareByDescending<Triple<Int, String, Double>> { it.third }
+                .thenBy { it.first })
+            .take(maxExcerpts)
+            .sortedBy { it.first }
+            .map { it.second }
+
+        return if (top.any { chunk -> terms.any { it in chunk.lowercase() } }) {
+            top
+        } else {
+            evenlySpaced(all, maxExcerpts)
+        }
+    }
+
+    private fun evenlySpaced(chunks: List<String>, count: Int): List<String> {
+        if (chunks.size <= count) return chunks
+        if (count <= 1) return listOf(chunks.first())
+        val indexes = (0 until count).map { i ->
+            ((i.toDouble() * (chunks.lastIndex)) / (count - 1)).toInt()
+        }.distinct()
+        return indexes.map { chunks[it] }
     }
 
     // ── stages ──────────────────────────────────────────────────────────────────
@@ -182,7 +302,11 @@ class SummarizeEngine(
     }
 
     /** pipeline._build_detailed: single pass when it fits, else batch then merge. */
-    private suspend fun buildDetailed(src: String): String {
+    private suspend fun buildDetailed(
+        src: String,
+        existingParts: List<String> = emptyList(),
+        onParts: suspend (List<String>) -> Unit = {},
+    ): String {
         // Detailed wants real length. Give the cloud engine a large output budget
         // (~2 full pages); on-device stays modest so it doesn't run for ages.
         val onePassCap = if (bigContext) 4000 else 1600
@@ -191,8 +315,10 @@ class SummarizeEngine(
             return streamCollect(Prompts.DETAILED, source(src), maxTokens = onePassCap)
         }
         val chunks = chunkTextCapped(src)
-        val parts = chunks.map {
-            streamCollect(Prompts.DETAILED, source(it), maxTokens = chunkCap)
+        val parts = existingParts.take(chunks.size).toMutableList()
+        for (i in parts.size until chunks.size) {
+            parts.add(streamCollect(Prompts.DETAILED, source(chunks[i]), maxTokens = chunkCap))
+            onParts(parts.toList())
         }
         return parts.joinToString("\n\n")
     }
@@ -262,4 +388,15 @@ class SummarizeEngine(
         if (s.isNotEmpty()) out.add(s)
         return out
     }
+    companion object {
+        private val WORD_REGEX = Regex("[\\p{L}\\p{N}']+")
+        private val ASK_STOP_WORDS = setOf(
+            "the", "and", "for", "that", "this", "with", "from", "what", "when",
+            "where", "which", "who", "why", "how", "does", "did", "was", "were",
+            "are", "is", "can", "could", "would", "should", "about", "into", "than",
+            "then", "they", "them", "their", "there", "have", "has", "had", "you",
+            "your", "its", "but", "not", "all", "any", "some", "more", "most"
+        )
+    }
+
 }

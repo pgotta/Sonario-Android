@@ -5,8 +5,8 @@ link (or share one into the app) and get skimmable notes, a detailed prose view,
 or a bulleted outline.
 
 **Status:** working. YouTube transcript summarization, web-article and pasted-text
-summarization, the Groq cloud engine, and the on-device engine are all functional
-as of version 1.1.0.
+summarization, Groq cloud, on-device inference, saved sessions, resumable
+checkpoints, and source Q&A are functional as of version 1.3.3.
 
 Sonario has two engines, and you pick which to use per summary:
 
@@ -18,7 +18,23 @@ Sonario has two engines, and you pick which to use per summary:
   phone except fetching the link), but slow: CPU-only, so a summary takes minutes
   and the phone warms up. A private fallback rather than the daily driver.
 
+## Highlights
+
+- Summarizes YouTube captions, web articles, pasted text, PDF, EPUB, DOCX, TXT,
+  and Markdown files.
+- Keeps long cloud summaries alive with a foreground service and retries
+  temporary DNS, timeout, and network-handoff failures.
+- Saves up to 12 recent sessions locally, restores the latest session on launch,
+  and resumes from checkpoints without repeating completed model calls.
+- Includes Normal, Detailed, Bullets, and chapter views, plus source-grounded
+  **Ask about this** Q&A.
+- Lets users delete one session or clear all locally stored transcripts,
+  summaries, checkpoints, and Q&A history.
+
 ## Screenshots
+
+> Add three screenshots to `docs/screenshots/` (`main.png`, `summary.png`,
+> `setup.png`) - see that folder's README. Until then these images show as broken.
 
 <p align="center">
   <img src="docs/screenshots/main.png" width="30%" alt="Main screen" />
@@ -76,7 +92,7 @@ The two engines differ, and the app shows which is active:
 
 ## How YouTube transcripts are fetched
 
-Version 1.1.0 uses a layered extractor rather than relying on one caption URL:
+Sonario uses a layered extractor rather than relying on one caption URL:
 
 1. Load the watch page in one cookie-preserving session and handle YouTube's
    consent page when it appears.
@@ -93,6 +109,24 @@ reports Proof-of-Origin-token tracks accurately instead of claiming the video ha
 no captions. These are still undocumented YouTube endpoints, so a future YouTube
 change can require another extractor update. Failed requests show **Extractor
 build 2** diagnostics so you can confirm the new APK is actually installed.
+
+
+## Background reliability and Ask fixes (1.2.0)
+
+- Cloud requests now retry transient DNS, Wi-Fi/mobile-data handoff, connection,
+  and timeout failures for up to ten minutes instead of immediately ending with
+  `Unable to resolve host api.groq.com`.
+- A foreground service holds a partial CPU wake lock and a temporary Wi-Fi lock
+  only while a summary or source question is active. The notification displays
+  rate-limit waits and network-retry status.
+- Groq responses are buffered before being committed to a summary, so a failed
+  connection can be retried without duplicating a partial response.
+- The Ask box now shows the actual API/network error in place, keeps the typed
+  question after a failure, and searches relevant passages across the whole
+  source instead of sending only the first portion of a long video or book.
+- Long jobs have a visible Cancel control, stale errors clear when a new source is
+  entered, and the app no longer treats a failed Ask call as a successful generic
+  answer.
 
 ## On-device models (downloaded on first run, not bundled)
 
@@ -148,3 +182,19 @@ cloud inference via Groq.
 ## License
 
 MIT. See LICENSE.
+
+## Clear all saved sessions (1.3.1)
+
+The Recent sessions card now has a **Clear** button. After confirmation, it permanently deletes all locally saved session folders, including source transcripts, chapter data, summaries, checkpoints, and saved Q&A. Exported files outside the app are left alone.
+
+## Saved and resumable sessions (1.3.0)
+
+Sonario now saves summaries locally instead of keeping the only copy in an Activity/ViewModel. The most recent session is restored after an app or Activity restart, and a Recent sessions panel can open, resume, or delete prior work.
+
+For long summaries, Sonario checkpoints after every completed LLM call. If Android or the network interrupts the run, Resume skips already-completed condensed chunks and derived views so those Groq tokens are not spent twice. Completed source text and Ask history are stored with the session. Up to 12 recent sessions are retained in the app's private files directory.
+
+## Keyboard-safe Ask field (1.3.3)
+
+The Ask field follows the software keyboard into view, supports two to four
+lines of editing, offers the keyboard Send action, and preserves unfinished text
+across ordinary Activity recreation.

@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a reproducible Sonario problem
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Sonario version
+      placeholder: 1.3.3
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device and Android version
+      placeholder: Samsung Galaxy S24, Android 16
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - YouTube transcript
+        - Web article
+        - Local file
+        - Groq cloud
+        - On-device model
+        - Background service
+        - Saved sessions
+        - Ask about this
+        - Build/install
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the exact sequence and any non-sensitive diagnostics.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sensitive information
+      options:
+        - label: I removed API keys, cookies, private source text, and other secrets.
+          required: true

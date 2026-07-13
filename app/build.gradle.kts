@@ -12,8 +12,8 @@ android {
         applicationId = "ai.sonario.app"
         minSdk = 28          // Android 9. 8 Elite phones are far above this.
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.1.0"
+        versionCode = 9
+        versionName = "1.3.3"
         vectorDrawables { useSupportLibrary = true }
         ndk { abiFilters += "arm64-v8a" }  // modern phones; keeps APK lean
     }

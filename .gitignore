@@ -1,13 +1,34 @@
+# Android Studio / IntelliJ
 *.iml
+.idea/
+
+# Gradle and Android build outputs
 .gradle/
-/local.properties
-/.idea/
-.DS_Store
-/build/
-/app/build/
-/captures/
+build/
+app/build/
+captures/
 .externalNativeBuild/
 .cxx/
+
+# Machine-local Android SDK configuration
+local.properties
+
+# Release signing material and local secrets
+*.jks
+*.keystore
+keystore.properties
+.env
+.env.*
+
+# Generated packages and large local models
 *.apk
+*.aab
+*.apks
 *.gguf
 app/src/main/assets/*.gguf
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
