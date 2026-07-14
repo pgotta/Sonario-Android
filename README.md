@@ -33,9 +33,6 @@ Sonario has two engines, and you pick which to use per summary:
 
 ## Screenshots
 
-> Add three screenshots to `docs/screenshots/` (`main.png`, `summary.png`,
-> `setup.png`) - see that folder's README. Until then these images show as broken.
-
 <p align="center">
   <img src="docs/screenshots/main.png" width="30%" alt="Main screen" />
   &nbsp;
