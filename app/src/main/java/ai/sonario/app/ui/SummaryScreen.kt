@@ -51,7 +51,7 @@ fun SummaryScreen(
                         )
                         if (vm.isCloud) {
                             Text(
-                                text = "${vm.activeProvider.displayName} · $providerModel",
+                                text = "${vm.activeProvider.displayName} · ${vm.providerModel}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.primary,
                             )
