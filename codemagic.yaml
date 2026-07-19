@@ -1,0 +1,40 @@
+workflows:
+  android-debug:
+    name: Android Debug Build
+    max_build_duration: 60
+    instance_type: linux_x2
+    environment:
+      java: 17
+    cache:
+      cache_paths:
+        - ~/.gradle/caches
+        - ~/.gradle/wrapper
+        - ~/.android/build-cache
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: 'upgrade/multi-provider-byok'
+          include: true
+          source: true
+        - pattern: 'main'
+          include: true
+          source: true
+      cancel_previous_builds: true
+    scripts:
+      - name: Set Android SDK location
+        script: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > "$CM_BUILD_DIR/local.properties"
+      - name: Build debug APK
+        script: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+    artifacts:
+      - app/build/outputs/apk/debug/*.apk
+    publishing:
+      email:
+        recipients:
+          - will.harris.jp@gmail.com
+        notify:
+          success: true
+          failure: true
