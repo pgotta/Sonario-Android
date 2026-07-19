@@ -18,8 +18,9 @@ import androidx.compose.ui.unit.dp
 import ai.sonario.app.data.EngineChoice
 
 /**
- * Settings: choose the engine and, for the Groq cloud engine, paste an API key
- * and set the model string. The key is stored locally on the device only.
+ * Settings: choose the engine and, for Groq cloud, save an API key. Sonario's
+ * cloud model is fixed to Qwen 3.6 27B so saved sessions cannot restore a retired
+ * or incompatible model ID.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -28,7 +29,6 @@ fun SettingsScreen(vm: SummaryViewModel, onBack: () -> Unit) {
     val scroll = rememberScrollState()
 
     var keyInput by remember { mutableStateOf("") }
-    var modelInput by remember { mutableStateOf(ui.groqModel) }
 
     Scaffold(
         containerColor = SonarioColors.Deep,
@@ -37,33 +37,42 @@ fun SettingsScreen(vm: SummaryViewModel, onBack: () -> Unit) {
                 title = { Text("Settings", color = SonarioColors.Ink) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back",
-                            tint = SonarioColors.InkSoft)
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            "Back",
+                            tint = SonarioColors.InkSoft,
+                        )
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = SonarioColors.Deep),
+                    containerColor = SonarioColors.Deep,
+                ),
             )
-        }
+        },
     ) { pad ->
         Column(
-            Modifier.padding(pad).verticalScroll(scroll).padding(16.dp)
+            Modifier
+                .padding(pad)
+                .verticalScroll(scroll)
+                .padding(16.dp),
         ) {
-            // Engine choice
-            Text("Where the AI runs", color = SonarioColors.InkSoft,
-                style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Where the AI runs",
+                color = SonarioColors.InkSoft,
+                style = MaterialTheme.typography.labelLarge,
+            )
             Spacer(Modifier.height(10.dp))
             EngineOption(
                 title = "On-device",
                 subtitle = "Runs the model on your phone. Private, but slow " +
-                        "(CPU only). Needs a downloaded model.",
+                    "(CPU only). Needs a downloaded model.",
                 selected = ui.engineChoice == EngineChoice.ON_DEVICE,
                 onClick = { vm.setEngine(EngineChoice.ON_DEVICE) },
             )
             EngineOption(
                 title = "Groq (cloud)",
-                subtitle = "Fast. Sends your text to Groq's servers to summarize. " +
-                        "Needs a free API key below.",
+                subtitle = "Fast. Sends your text to Groq's servers and uses " +
+                    "Qwen 3.6 27B. Needs a Groq API key below.",
                 selected = ui.engineChoice == EngineChoice.GROQ,
                 onClick = { vm.setEngine(EngineChoice.GROQ) },
             )
@@ -72,39 +81,46 @@ fun SettingsScreen(vm: SummaryViewModel, onBack: () -> Unit) {
             HorizontalDivider(color = SonarioColors.RuleSoft)
             Spacer(Modifier.height(20.dp))
 
-            // Groq settings
-            Text("Groq cloud", color = SonarioColors.InkSoft,
-                style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Groq cloud",
+                color = SonarioColors.InkSoft,
+                style = MaterialTheme.typography.labelLarge,
+            )
             Spacer(Modifier.height(6.dp))
             Text(
-                "Get a free API key at console.groq.com (no credit card). Create a " +
-                "key, then paste it here. Your key is stored only on this device " +
-                "and is sent solely to Groq when you summarize.",
+                "Get an API key at console.groq.com, then paste it here. Your key " +
+                    "is stored only on this device and is sent solely to Groq when " +
+                    "you summarize.",
                 color = SonarioColors.Muted,
-                style = MaterialTheme.typography.bodyMedium)
+                style = MaterialTheme.typography.bodyMedium,
+            )
             Spacer(Modifier.height(12.dp))
 
             if (ui.groqKeySet) {
-                Text("Key saved: ${vm.currentGroqKeyMasked()}",
+                Text(
+                    "Key saved: ${vm.currentGroqKeyMasked()}",
                     color = SonarioColors.Green,
-                    style = MaterialTheme.typography.labelLarge)
+                    style = MaterialTheme.typography.labelLarge,
+                )
                 Spacer(Modifier.height(6.dp))
                 val (used, limit) = vm.groqDailyUsage()
                 val remaining = (limit - used).coerceAtLeast(0)
                 val pct = if (limit > 0) (remaining * 100 / limit).toInt() else 0
                 Text(
-                    "Daily budget: $pct% remaining " +
-                    "(~${fmtK(remaining)} of ${fmtK(limit)} tokens left today)",
+                    "Sonario budget: $pct% remaining " +
+                        "(~${fmtK(remaining)} of ${fmtK(limit)} tokens left today)",
                     color = if (pct < 15) SonarioColors.Teal else SonarioColors.Muted,
-                    style = MaterialTheme.typography.bodyMedium)
+                    style = MaterialTheme.typography.bodyMedium,
+                )
                 Text(
-                    "Counts usage through this app only; resets daily. Groq's free " +
-                    "tier is about ${fmtK(limit)} tokens/day.",
+                    "This is Sonario's conservative local counter. Groq applies " +
+                        "limits across the entire organization, including use outside this app.",
                     color = SonarioColors.Muted,
-                    style = MaterialTheme.typography.bodySmall)
+                    style = MaterialTheme.typography.bodySmall,
+                )
                 Spacer(Modifier.height(4.dp))
                 TextButton(onClick = { vm.resetDailyBudget() }) {
-                    Text("Reset counter", color = SonarioColors.Green)
+                    Text("Reset local counter", color = SonarioColors.Green)
                 }
                 Spacer(Modifier.height(8.dp))
             }
@@ -131,38 +147,57 @@ fun SettingsScreen(vm: SummaryViewModel, onBack: () -> Unit) {
                 enabled = keyInput.isNotBlank(),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = SonarioColors.Green,
-                    contentColor = SonarioColors.Abyss),
+                    contentColor = SonarioColors.Abyss,
+                ),
             ) { Text("Save key") }
 
             Spacer(Modifier.height(20.dp))
 
-            OutlinedTextField(
-                value = modelInput,
-                onValueChange = { modelInput = it },
-                label = { Text("Groq model") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            Surface(
+                color = SonarioColors.Panel,
+                shape = RoundedCornerShape(14.dp),
                 modifier = Modifier.fillMaxWidth(),
-                colors = sonarioFieldColors(),
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "Model names change over time. Default is Llama 4 Scout. If Groq " +
-                "retires it, set another from console.groq.com/docs/models.",
-                color = SonarioColors.Muted,
-                style = MaterialTheme.typography.bodyMedium)
-            Spacer(Modifier.height(8.dp))
-            OutlinedButton(
-                onClick = { vm.setGroqModel(modelInput) },
-                colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = SonarioColors.InkSoft),
-            ) { Text("Save model") }
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text(
+                        "Cloud model",
+                        color = SonarioColors.Muted,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Qwen 3.6 27B",
+                        color = SonarioColors.Ink,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        "qwen/qwen3.6-27b",
+                        color = SonarioColors.Green,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "Free-tier baseline: 8K tokens/minute and 200K tokens/day. " +
+                            "Sonario splits large sources, waits between calls, follows " +
+                            "Groq's live reset headers, and saves a checkpoint after each call.",
+                        color = SonarioColors.Muted,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Groq limits are organization-wide. Extra keys in the same " +
+                            "organization share the same quota and do not increase it.",
+                        color = SonarioColors.Muted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
 
             Spacer(Modifier.height(24.dp))
             HorizontalDivider(color = SonarioColors.RuleSoft)
             Spacer(Modifier.height(12.dp))
             Text(
-                "Sonario 1.3.3 • keyboard-safe Ask field",
+                "Sonario 1.4.0 • Qwen 3.6 cloud and rate-aware queueing",
                 color = SonarioColors.Muted,
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -181,27 +216,39 @@ private fun EngineOption(
     Surface(
         color = if (selected) SonarioColors.Panel2 else SonarioColors.Panel,
         shape = RoundedCornerShape(14.dp),
-        modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 10.dp),
         onClick = onClick,
     ) {
-        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             RadioButton(
                 selected = selected,
                 onClick = onClick,
                 colors = RadioButtonDefaults.colors(
                     selectedColor = SonarioColors.Green,
-                    unselectedColor = SonarioColors.Muted),
+                    unselectedColor = SonarioColors.Muted,
+                ),
             )
             Spacer(Modifier.width(8.dp))
             Column {
-                Text(title, color = SonarioColors.Ink, fontWeight = FontWeight.SemiBold)
-                Text(subtitle, color = SonarioColors.Muted,
-                    style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    title,
+                    color = SonarioColors.Ink,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    subtitle,
+                    color = SonarioColors.Muted,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
             }
         }
     }
 }
-
 
 /** Compact token count: 480000 -> "480K", 1200000 -> "1.2M". */
 private fun fmtK(n: Long): String = when {
