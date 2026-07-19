@@ -2,6 +2,24 @@
 
 All notable changes to Sonario for Android are documented here.
 
+## 1.5.0
+
+- Replaces the previous Qwen2.5 1.5B, Llama 3.2 3B, and Phi-3.5 Mini downloads
+  with three newer mobile-oriented choices:
+  - Qwen3 4B Instruct 2507 for the strongest overall local summaries and Q&A.
+  - Gemma 3n E4B Instruct for nuanced long-form summaries and writing.
+  - LFM2 2.6B for the smallest download and fastest local responses.
+- Shows a plain-language strength/tradeoff description and formatted download size
+  before the user downloads each model.
+- Updates the Android llama.cpp wrapper to Llamatik 1.8.1 for current Qwen3,
+  Gemma 3n, and LFM2 GGUF support.
+- Adds a free-storage check and fixes resumable downloads when a host ignores an
+  HTTP Range request.
+- Removes obsolete local-model and partial-download files left by older versions.
+- Keeps all model files in private app storage, explicitly disables uninstall data
+  retention, and excludes the `models/` directory from cloud backup and device
+  transfer so multi-gigabyte models cannot return after reinstall.
+
 ## 1.4.0
 
 - Replaces the retired Llama 4 Scout cloud model with the fixed Groq model

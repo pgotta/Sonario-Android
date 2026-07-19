@@ -13,38 +13,60 @@ import java.io.File
 
 /**
  * On-device LLM engine, backed by Llamatik (a Maven-published Kotlin wrapper
- * around llama.cpp - no NDK, no native build on your side).
+ * around llama.cpp - no NDK or native build is required by this project).
  *
- * This is the mobile analogue of Sonario desktop's providers.py. Desktop talked
- * to Ollama over HTTP; here the model runs in-process. One model stays loaded at
- * a time, reused for every stage (condense + synthesis), because 8GB-class
- * phones don't have headroom to hold two and reloading mid-job stalls badly.
- *
- * The whole app is written against this small interface, so swapping inference
- * backends later means editing only this file.
+ * One model stays loaded at a time and is reused for every summarization stage.
+ * The model files live only in Sonario's private app storage, so Android removes
+ * them automatically when the app is uninstalled.
  */
 class LlmEngine private constructor(private val appContext: Context) : InferenceEngine {
 
     @Volatile var loadedModel: String? = null
         private set
 
+    @Volatile private var legacyCleanupDone = false
+
     /** InferenceEngine entry point: for on-device this loads the GGUF. */
     override suspend fun ensureReady(model: ModelInfo) = ensureLoaded(model)
 
-    /** Where downloaded GGUF models live. */
-    fun modelsDir(): File =
-        File(appContext.filesDir, "models").apply { mkdirs() }
+    /**
+     * Where downloaded GGUF models live. This is Context.filesDir, which is
+     * app-specific internal storage and is deleted by Android on uninstall.
+     */
+    fun modelsDir(): File {
+        val dir = File(appContext.filesDir, "models").apply { mkdirs() }
+        cleanupLegacyModelsOnce(dir)
+        return dir
+    }
 
-    fun availableModels(): List<ModelInfo> = BUNDLED_MODELS.map { m ->
-        m.copy(present = File(modelsDir(), m.fileName).exists())
+    fun availableModels(): List<ModelInfo> = BUNDLED_MODELS.map { model ->
+        model.copy(present = File(modelsDir(), model.fileName).exists())
     }
 
     fun isModelPresent(model: ModelInfo): Boolean =
         File(modelsDir(), model.fileName).exists()
 
     /**
-     * Load a GGUF into llama.cpp. Idempotent. Heavy - call off the main thread
-     * (the summarize pipeline already does).
+     * Remove the three superseded model downloads from Sonario 1.4 and earlier.
+     * They are no longer offered, and silently leaving several gigabytes of
+     * unreachable files behind would waste storage after an app update.
+     */
+    private fun cleanupLegacyModelsOnce(dir: File) {
+        if (legacyCleanupDone) return
+        synchronized(this) {
+            if (legacyCleanupDone) return
+            LEGACY_MODEL_FILES.forEach { name ->
+                File(dir, name).delete()
+                File(dir, "$name.part").delete()
+            }
+            legacyCleanupDone = true
+        }
+    }
+
+    /**
+     * Load a GGUF into llama.cpp. Idempotent and intentionally performed off the
+     * main thread. Memory mapping keeps the resident-RAM cost below copying the
+     * complete multi-gigabyte file into memory.
      */
     suspend fun ensureLoaded(model: ModelInfo) = withContext(Dispatchers.Default) {
         if (loadedModel == model.fileName) return@withContext
@@ -52,28 +74,29 @@ class LlmEngine private constructor(private val appContext: Context) : Inference
         require(path.exists()) { "Model file missing: ${model.fileName}" }
 
         if (loadedModel != null) {
-            // switching models: free the old context first
             runCatching { LlamaBridge.shutdown() }
             loadedModel = null
         }
 
-        // Load-time params must be set before initGenerateModel.
         LlamaBridge.updateGenerateParams(
-            temperature = 0.5f,        // summaries want low randomness
+            temperature = 0.35f,
             maxTokens = 1024,
-            topP = 0.95f,
+            topP = 0.9f,
             topK = 40,
             repeatPenalty = 1.1f,
             contextLength = model.contextTokens,
             numThreads = pickThreads(),
-            useMmap = true,            // memory-map weights; lighter on RAM
-            flashAttention = false,
+            useMmap = true,
+            flashAttention = true,
             batchSize = 256,
-            gpuLayers = -1,            // best-effort GPU offload; falls back to CPU if unsupported
+            gpuLayers = -1,
         )
 
         val ok = LlamaBridge.initGenerateModel(path.absolutePath)
-        require(ok) { "Llamatik failed to load ${model.fileName}" }
+        require(ok) {
+            "Sonario could not load ${model.label}. The download may be incomplete " +
+                "or this phone may not have enough free memory."
+        }
         loadedModel = model.fileName
     }
 
@@ -82,30 +105,25 @@ class LlmEngine private constructor(private val appContext: Context) : Inference
         loadedModel = null
     }
 
-    /**
-     * Stream a completion. Mirrors providers.Provider.chat(system, user): the
-     * system prompt steers, the user prompt carries the source. Emits token by
-     * token so the UI shows the summary forming live.
-     *
-     * Uses Llamatik's generateWithContextStream with an empty context block;
-     * Sonario folds everything into system + user, matching the desktop app.
-     */
+    /** Stream one completion while keeping generation work off the UI thread. */
     override fun stream(system: String, user: String, maxTokens: Int): Flow<String> =
         callbackFlow {
-            // maxTokens can change per call without a reload.
             runCatching {
                 LlamaBridge.updateGenerateParams(
-                    temperature = 0.5f, maxTokens = maxTokens, topP = 0.95f,
-                    topK = 40, repeatPenalty = 1.1f,
-                    contextLength = currentContext(), numThreads = pickThreads(),
-                    useMmap = true, flashAttention = false, batchSize = 256,
+                    temperature = 0.35f,
+                    maxTokens = maxTokens,
+                    topP = 0.9f,
+                    topK = 40,
+                    repeatPenalty = 1.1f,
+                    contextLength = currentContext(),
+                    numThreads = pickThreads(),
+                    useMmap = true,
+                    flashAttention = true,
+                    batchSize = 256,
                     gpuLayers = -1,
                 )
             }
-            // Run generation in its own job. Llamatik's streaming call blocks the
-            // calling thread until generation completes (it drives the callbacks
-            // inline), so launching it here lets awaitClose register first and
-            // keeps this dispatcher free to deliver cancellation.
+
             val job = launch(Dispatchers.Default) {
                 try {
                     LlamaBridge.generateWithContextStream(
@@ -114,10 +132,10 @@ class LlmEngine private constructor(private val appContext: Context) : Inference
                         user = user,
                         onDelta = { token -> trySend(token) },
                         onDone = { close() },
-                        onError = { msg -> close(RuntimeException(msg)) },
+                        onError = { message -> close(RuntimeException(message)) },
                     )
-                } catch (e: Throwable) {
-                    close(e)
+                } catch (error: Throwable) {
+                    close(error)
                 }
             }
             awaitClose {
@@ -131,13 +149,18 @@ class LlmEngine private constructor(private val appContext: Context) : Inference
 
     private fun pickThreads(): Int {
         val cores = Runtime.getRuntime().availableProcessors()
-        // Use the big cores. Modern flagships have 8 cores; leaving one free
-        // keeps the UI responsive while giving inference most of the CPU.
         return (cores - 1).coerceIn(4, 8)
     }
 
     companion object {
+        private val LEGACY_MODEL_FILES = listOf(
+            "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+            "llama-3.2-3b-instruct-q4_k_m.gguf",
+            "phi-3.5-mini-instruct-q4_k_m.gguf",
+        )
+
         @Volatile private var INSTANCE: LlmEngine? = null
+
         fun get(context: Context): LlmEngine =
             INSTANCE ?: synchronized(this) {
                 INSTANCE ?: LlmEngine(context.applicationContext).also { INSTANCE = it }
@@ -156,37 +179,35 @@ data class ModelInfo(
 )
 
 /**
- * Models that suit an 8GB-class phone (Snapdragon 8 Elite, ~12-16GB RAM). All
- * are small enough to load fully into RAM and run at usable speed via llama.cpp
- * with Q4_K_M quantization. The download URLs point at public GGUF repos on
- * Hugging Face. The first-run picker downloads exactly one.
+ * Mobile-oriented local models. Q4_K_M is used as the quality/size compromise;
+ * context is deliberately capped at 4K to avoid an oversized KV cache on phones.
  */
 val BUNDLED_MODELS = listOf(
     ModelInfo(
-        label = "Qwen2.5 1.5B Instruct",
-        fileName = "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-        sizeMb = 1100,
+        label = "Qwen3 4B Instruct 2507",
+        fileName = "qwen3-4b-instruct-2507-q4_k_m.gguf",
+        sizeMb = 2500,
         contextTokens = 4096,
-        note = "Fast, good summaries. The safe default for any 8GB+ phone.",
-        downloadUrl = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/" +
-            "resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf?download=true",
+        note = "Best overall. Strongest summaries, comprehension, and follow-up answers; larger and slower than LFM2.",
+        downloadUrl = "https://huggingface.co/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/" +
+            "resolve/main/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf?download=true",
     ),
     ModelInfo(
-        label = "Llama 3.2 3B Instruct",
-        fileName = "llama-3.2-3b-instruct-q4_k_m.gguf",
-        sizeMb = 2000,
+        label = "Gemma 3n E4B Instruct",
+        fileName = "gemma-3n-e4b-it-q4_k_m.gguf",
+        sizeMb = 4240,
         contextTokens = 4096,
-        note = "Stronger synthesis, comfortable on the S26 Ultra. Slower.",
-        downloadUrl = "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/" +
-            "resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf?download=true",
+        note = "Best for nuanced long-form summaries and writing. Mobile-designed, but the largest download and slowest option.",
+        downloadUrl = "https://huggingface.co/second-state/gemma-3n-E4B-it-GGUF/" +
+            "resolve/main/gemma-3n-E4B-it-Q4_K_M.gguf?download=true",
     ),
     ModelInfo(
-        label = "Phi-3.5 Mini Instruct",
-        fileName = "phi-3.5-mini-instruct-q4_k_m.gguf",
-        sizeMb = 2300,
+        label = "LFM2 2.6B",
+        fileName = "lfm2-2.6b-q4_k_m.gguf",
+        sizeMb = 1560,
         contextTokens = 4096,
-        note = "Roomy context comfort for long transcripts.",
-        downloadUrl = "https://huggingface.co/bartowski/Phi-3.5-mini-instruct-GGUF/" +
-            "resolve/main/Phi-3.5-mini-instruct-Q4_K_M.gguf?download=true",
+        note = "Fastest and smallest. Good for quick summaries and extraction; less capable with difficult or subtle material.",
+        downloadUrl = "https://huggingface.co/LiquidAI/LFM2-2.6B-GGUF/" +
+            "resolve/main/LFM2-2.6B-Q4_K_M.gguf?download=true",
     ),
 )

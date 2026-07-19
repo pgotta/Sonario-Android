@@ -13,16 +13,17 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 
 /**
- * Downloads a GGUF model into the app's models dir, with progress and resume.
- * This is what makes step 3 ("get a model onto the phone") happen in-app instead
- * of by adb. Resume uses an HTTP Range request against a .part file, so a dropped
- * connection on a 1-2GB download doesn't start over.
+ * Downloads a GGUF model into Sonario's private model directory with progress and
+ * HTTP Range resume. Partial downloads remain as .part files until resumed or
+ * Android removes the app's private data during uninstall.
  */
 class ModelDownloader(private val modelsDir: File) {
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 
     sealed interface State {
@@ -33,74 +34,117 @@ class ModelDownloader(private val modelsDir: File) {
         data class Failed(val message: String) : State
     }
 
-    /**
-     * Stream download states. The final emission is Done or Failed. Cancelling
-     * the collecting coroutine stops the download and leaves the .part file in
-     * place for a later resume.
-     */
     fun download(model: ModelInfo): Flow<State> = flow {
+        modelsDir.mkdirs()
         val target = File(modelsDir, model.fileName)
-        if (target.exists() && target.length() > 0) {
-            emit(State.Done(target)); return@flow
+        if (target.exists() && target.length() > 0L) {
+            emit(State.Done(target))
+            return@flow
         }
-        val part = File(modelsDir, model.fileName + ".part")
-        val have = if (part.exists()) part.length() else 0L
 
-        val reqBuilder = Request.Builder().url(model.downloadUrl)
-            .header("User-Agent", "Sonario/1.0")
-        if (have > 0) reqBuilder.header("Range", "bytes=$have-")
+        val part = File(modelsDir, model.fileName + ".part")
+        var offset = if (part.exists()) part.length() else 0L
+        val estimatedBytes = model.sizeMb.toLong() * 1_000_000L
+        val remainingEstimate = (estimatedBytes - offset).coerceAtLeast(0L)
+        val requiredWithHeadroom = remainingEstimate + STORAGE_HEADROOM_BYTES
+
+        if (modelsDir.usableSpace < requiredWithHeadroom) {
+            val neededMb = requiredWithHeadroom / 1_000_000L
+            val freeMb = modelsDir.usableSpace / 1_000_000L
+            emit(
+                State.Failed(
+                    "Not enough free storage for ${model.label}. " +
+                        "About $neededMb MB is needed, but only $freeMb MB is available."
+                )
+            )
+            return@flow
+        }
+
+        val requestBuilder = Request.Builder()
+            .url(model.downloadUrl)
+            .header("User-Agent", "Sonario/1.5")
+        if (offset > 0L) requestBuilder.header("Range", "bytes=$offset-")
 
         try {
-            http.newCall(reqBuilder.build()).execute().use { resp ->
-                if (!resp.isSuccessful && resp.code != 206) {
-                    emit(State.Failed("Server returned ${resp.code}. " +
-                        "Check the connection and try again."))
+            http.newCall(requestBuilder.build()).execute().use { response ->
+                if (!response.isSuccessful && response.code != 206) {
+                    emit(
+                        State.Failed(
+                            "Model server returned ${response.code}. Check the connection and try again."
+                        )
+                    )
                     return@flow
                 }
-                val body = resp.body ?: run {
-                    emit(State.Failed("Empty response from server.")); return@flow
+
+                val body = response.body ?: run {
+                    emit(State.Failed("The model server returned an empty response."))
+                    return@flow
                 }
 
-                // total = already-downloaded + remaining content length
+                // Some hosts ignore Range and return 200 with the complete file.
+                // Restart rather than appending a second full copy to the partial.
+                if (offset > 0L && response.code == 200) {
+                    offset = 0L
+                }
+
                 val remaining = body.contentLength()
-                val total = if (remaining > 0) have + remaining
-                            else model.sizeMb.toLong() * 1_000_000L  // estimate
+                val total = when {
+                    response.code == 206 && remaining > 0L -> offset + remaining
+                    remaining > 0L -> remaining
+                    else -> estimatedBytes
+                }
 
-                val raf = RandomAccessFile(part, "rw")
-                raf.seek(have)
-                var written = have
+                RandomAccessFile(part, "rw").use { output ->
+                    if (offset == 0L) output.setLength(0L)
+                    output.seek(offset)
+                    var written = offset
+                    var lastEmit = offset
 
-                body.byteStream().use { input ->
-                    val buf = ByteArray(64 * 1024)
-                    var lastEmit = 0L
-                    while (true) {
-                        coroutineContext.ensureActive()  // honour cancellation
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        raf.write(buf, 0, n)
-                        written += n
-                        // throttle UI updates to ~every 512KB
-                        if (written - lastEmit > 512 * 1024) {
-                            emit(State.Progress(written, total))
-                            lastEmit = written
+                    body.byteStream().use { input ->
+                        val buffer = ByteArray(128 * 1024)
+                        while (true) {
+                            coroutineContext.ensureActive()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                            written += count
+
+                            if (written - lastEmit >= PROGRESS_STEP_BYTES) {
+                                emit(State.Progress(written, total))
+                                lastEmit = written
+                            }
                         }
                     }
                 }
-                raf.close()
+
+                val minimumPlausibleSize = estimatedBytes * 85L / 100L
+                if (part.length() < minimumPlausibleSize) {
+                    emit(
+                        State.Failed(
+                            "The model download ended early. Keep the partial file and tap Retry to resume."
+                        )
+                    )
+                    return@flow
+                }
 
                 if (part.renameTo(target)) {
                     emit(State.Progress(target.length(), target.length()))
                     emit(State.Done(target))
                 } else {
-                    emit(State.Failed("Could not finalize the downloaded file."))
+                    emit(State.Failed("Sonario could not finalize the downloaded model file."))
                 }
             }
-        } catch (e: Exception) {
-            emit(State.Failed(e.message ?: "Download failed."))
+        } catch (error: Exception) {
+            emit(State.Failed(error.message ?: "Model download failed."))
         }
     }.flowOn(Dispatchers.IO)
 
     fun deletePartial(model: ModelInfo) {
         File(modelsDir, model.fileName + ".part").delete()
+    }
+
+    companion object {
+        private const val STORAGE_HEADROOM_BYTES = 256L * 1_000_000L
+        private const val PROGRESS_STEP_BYTES = 512L * 1024L
     }
 }
