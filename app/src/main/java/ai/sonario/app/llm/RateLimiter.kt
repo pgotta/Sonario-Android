@@ -4,29 +4,36 @@ import android.content.Context
 import kotlinx.coroutines.delay
 
 /**
- * Paces Groq requests to stay within the free-tier limits:
+ * Paces cloud requests so free-tier token caps are respected.
+ *
+ * Provider-agnostic: the per-minute and per-day caps are read from
+ * [RateLimiter.Config] so the same limiter works for Groq, OpenAI, and
+ * anyone else. The conservative defaults match Groq's free tier; users of
+ * other providers can widen them via [RateLimiter.Config].
+ *
  *   - ~30,000 tokens per minute (TPM)
  *   - ~500,000 tokens per day  (TPD)
  *
  * Before each request we estimate its token cost and, if sending it now would
  * exceed the per-minute budget, we wait until the rolling minute window has room.
- * Actual usage is reconciled from Groq's response headers when present. The daily
- * total is persisted so it survives app restarts within the same day.
- *
- * These limits are conservative defaults; Groq may grant a given model more. They
- * are safe lower bounds so we err toward not getting 429'd.
+ * Actual usage is reconciled from response headers when present. The daily total
+ * is persisted so it survives app restarts within the same day.
  */
-class RateLimiter(context: Context) {
+class RateLimiter(context: Context, private val config: Config = Config()) {
 
     private val prefs = context.applicationContext
         .getSharedPreferences("groq_rate", Context.MODE_PRIVATE)
 
-    // Conservative free-tier caps. Leave headroom below the real ceilings.
-    private val tpmLimit = 28_000L      // under the ~30k/min cap
-    private val tpdLimit = 480_000L     // under the ~500k/day cap
+    private val tpmLimit = config.tokensPerMinute
+    private val tpdLimit = config.tokensPerDay
 
     // Rolling per-minute window: timestamps (ms) paired with tokens spent.
     private val window = ArrayDeque<Pair<Long, Long>>()
+
+    data class Config(
+        val tokensPerMinute: Long = 28_000L,     // under the ~30k/min cap
+        val tokensPerDay: Long = 480_000L,      // under the ~500k/day cap
+    )
 
     data class DailyUsage(val used: Long, val limit: Long) {
         val remaining: Long get() = (limit - used).coerceAtLeast(0)
@@ -35,7 +42,6 @@ class RateLimiter(context: Context) {
     // ── daily tracking (persisted) ─────────────────────────────────────────────
 
     private fun today(): String {
-        // yyyyDDD-ish key from epoch day; no formatting deps needed.
         val epochDay = System.currentTimeMillis() / 86_400_000L
         return epochDay.toString()
     }
@@ -57,21 +63,11 @@ class RateLimiter(context: Context) {
 
     fun dailyUsage(): DailyUsage = DailyUsage(dailyUsed(), tpdLimit)
 
-    /**
-     * Reset the daily counter. Call when the API key changes: a different key has
-     * its own separate daily budget on Groq's side, so the old key's tally no
-     * longer applies.
-     */
     fun resetDaily() {
         prefs.edit().putString("day", today()).putLong("used", 0).apply()
         window.clear()
     }
 
-    /**
-     * A pre-flight estimate for summarizing [sourceText]. Accounts for the fact
-     * that map-reduce sends the text once for condensing plus a smaller combine
-     * pass, so total tokens are a bit more than the raw input.
-     */
     data class Estimate(
         val inputTokens: Long,
         val totalTokens: Long,
@@ -92,9 +88,7 @@ class RateLimiter(context: Context) {
         // Empirically ~1.3x the input plus generated summary tokens.
         val total = (input * 1.3).toLong() + 1200
         val remaining = dailyUsage().remaining
-        // ETA is dominated by per-minute pacing: how many minute-windows the
-        // total spans at tpmLimit, plus a little for actual generation.
-        val minutes = (total.toDouble() / tpmLimit)
+        val minutes = total.toDouble() / tpmLimit
         val etaSec = (minutes * 60).toLong().coerceAtLeast(2) + 4
         return Estimate(
             inputTokens = input,
@@ -106,7 +100,6 @@ class RateLimiter(context: Context) {
         )
     }
 
-    /** True if this many tokens would blow the daily cap (can't be waited out). */
     fun wouldExceedDaily(tokens: Long): Boolean = dailyUsed() + tokens > tpdLimit
 
     // ── per-minute pacing ──────────────────────────────────────────────────────
@@ -122,15 +115,10 @@ class RateLimiter(context: Context) {
         return window.sumOf { it.second }
     }
 
-    /**
-     * Milliseconds to wait before a request costing [tokens] can be sent without
-     * exceeding the per-minute budget. 0 if it can go now.
-     */
     fun waitMillisFor(tokens: Long): Long {
         val now = System.currentTimeMillis()
         val inWindow = tokensInWindow(now)
         if (inWindow + tokens <= tpmLimit) return 0
-        // Wait until the oldest entries age out enough to make room.
         var needed = inWindow + tokens - tpmLimit
         var waitUntil = now
         for ((ts, tok) in window) {
@@ -140,18 +128,16 @@ class RateLimiter(context: Context) {
         return (waitUntil - now).coerceAtLeast(0)
     }
 
-    /** Suspend until a request of [tokens] can proceed; reports wait seconds. */
     suspend fun awaitSlot(tokens: Long, onWaiting: (Long) -> Unit) {
         var wait = waitMillisFor(tokens)
         while (wait > 0) {
-            onWaiting((wait + 999) / 1000)  // ceil to seconds, for the UI
+            onWaiting((wait + 999) / 1000)
             val step = minOf(wait, 1000L)
             delay(step)
             wait = waitMillisFor(tokens)
         }
     }
 
-    /** Record tokens actually spent (estimate up front, reconcile from headers). */
     fun record(tokens: Long) {
         val now = System.currentTimeMillis()
         trimWindow(now)
