@@ -2,76 +2,34 @@ package ai.sonario.app.llm
 
 import android.content.Context
 import kotlinx.coroutines.delay
+import kotlin.math.ceil
+import kotlin.math.max
 
 /**
- * Paces Groq requests to stay within the free-tier limits:
- *   - ~30,000 tokens per minute (TPM)
- *   - ~500,000 tokens per day  (TPD)
+ * App-side pacing for Groq's free Qwen 3.6 27B limits.
  *
- * Before each request we estimate its token cost and, if sending it now would
- * exceed the per-minute budget, we wait until the rolling minute window has room.
- * Actual usage is reconciled from Groq's response headers when present. The daily
- * total is persisted so it survives app restarts within the same day.
- *
- * These limits are conservative defaults; Groq may grant a given model more. They
- * are safe lower bounds so we err toward not getting 429'd.
+ * Groq currently publishes 30 RPM, 8,000 TPM and 200,000 TPD for
+ * qwen/qwen3.6-27b. Sonario keeps a little headroom, queues requests instead of
+ * repeatedly receiving 429 responses, and also honors the token-window headers
+ * returned by Groq. Limits are organization-wide, so activity outside Sonario
+ * can still reduce what is available.
  */
 class RateLimiter(context: Context) {
 
     private val prefs = context.applicationContext
-        .getSharedPreferences("groq_rate", Context.MODE_PRIVATE)
+        .getSharedPreferences("groq_rate_qwen36", Context.MODE_PRIVATE)
 
-    // Conservative free-tier caps. Leave headroom below the real ceilings.
-    private val tpmLimit = 28_000L      // under the ~30k/min cap
-    private val tpdLimit = 480_000L     // under the ~500k/day cap
+    private val tokenWindow = ArrayDeque<Pair<Long, Long>>()
+    private val requestWindow = ArrayDeque<Long>()
 
-    // Rolling per-minute window: timestamps (ms) paired with tokens spent.
-    private val window = ArrayDeque<Pair<Long, Long>>()
+    @Volatile private var serverRemainingTokens: Long? = null
+    @Volatile private var serverTokenResetAtMs: Long = 0L
+    @Volatile private var serverBlockedUntilMs: Long = 0L
 
     data class DailyUsage(val used: Long, val limit: Long) {
         val remaining: Long get() = (limit - used).coerceAtLeast(0)
     }
 
-    // ── daily tracking (persisted) ─────────────────────────────────────────────
-
-    private fun today(): String {
-        // yyyyDDD-ish key from epoch day; no formatting deps needed.
-        val epochDay = System.currentTimeMillis() / 86_400_000L
-        return epochDay.toString()
-    }
-
-    private fun dailyUsed(): Long {
-        val day = prefs.getString("day", null)
-        if (day != today()) return 0
-        return prefs.getLong("used", 0)
-    }
-
-    private fun addDaily(tokens: Long) {
-        val used = if (prefs.getString("day", null) == today())
-            prefs.getLong("used", 0) else 0
-        prefs.edit()
-            .putString("day", today())
-            .putLong("used", used + tokens)
-            .apply()
-    }
-
-    fun dailyUsage(): DailyUsage = DailyUsage(dailyUsed(), tpdLimit)
-
-    /**
-     * Reset the daily counter. Call when the API key changes: a different key has
-     * its own separate daily budget on Groq's side, so the old key's tally no
-     * longer applies.
-     */
-    fun resetDaily() {
-        prefs.edit().putString("day", today()).putLong("used", 0).apply()
-        window.clear()
-    }
-
-    /**
-     * A pre-flight estimate for summarizing [sourceText]. Accounts for the fact
-     * that map-reduce sends the text once for condensing plus a smaller combine
-     * pass, so total tokens are a bit more than the raw input.
-     */
     data class Estimate(
         val inputTokens: Long,
         val totalTokens: Long,
@@ -86,81 +44,195 @@ class RateLimiter(context: Context) {
             else 100
     }
 
+    private fun today(): String =
+        (System.currentTimeMillis() / 86_400_000L).toString()
+
+    private fun dailyUsed(): Long {
+        if (prefs.getString("day", null) != today()) return 0L
+        return prefs.getLong("used", 0L)
+    }
+
+    private fun addDaily(tokens: Long) {
+        val used = if (prefs.getString("day", null) == today()) {
+            prefs.getLong("used", 0L)
+        } else {
+            0L
+        }
+        prefs.edit()
+            .putString("day", today())
+            .putLong("used", used + tokens.coerceAtLeast(0L))
+            .apply()
+    }
+
+    fun dailyUsage(): DailyUsage = DailyUsage(dailyUsed(), DAILY_WORKING_LIMIT)
+
+    fun resetDaily() {
+        prefs.edit().putString("day", today()).putLong("used", 0L).apply()
+        synchronized(this) {
+            tokenWindow.clear()
+            requestWindow.clear()
+            serverRemainingTokens = null
+            serverTokenResetAtMs = 0L
+            serverBlockedUntilMs = 0L
+        }
+    }
+
+    /**
+     * Estimate the whole Sonario job, not just its first request. Long cloud jobs
+     * normally read the source once for notes and again for the detailed view.
+     */
     fun estimate(sourceText: String): Estimate {
         val input = estimateTokens(sourceText)
-        // Map-reduce overhead: prompts on each chunk + a combine pass + output.
-        // Empirically ~1.3x the input plus generated summary tokens.
-        val total = (input * 1.3).toLong() + 1200
+        val total = (input * 2.4).toLong() + 5_000L
         val remaining = dailyUsage().remaining
-        // ETA is dominated by per-minute pacing: how many minute-windows the
-        // total spans at tpmLimit, plus a little for actual generation.
-        val minutes = (total.toDouble() / tpmLimit)
-        val etaSec = (minutes * 60).toLong().coerceAtLeast(2) + 4
+        val minuteWindows = ceil(total.toDouble() / TOKEN_WORKING_LIMIT).toLong()
+        val etaSec = (minuteWindows * 60L).coerceAtLeast(4L)
         return Estimate(
             inputTokens = input,
             totalTokens = total,
             dailyRemaining = remaining,
-            dailyLimit = tpdLimit,
+            dailyLimit = DAILY_WORKING_LIMIT,
             exceedsDaily = total > remaining,
             etaSeconds = etaSec,
         )
     }
 
-    /** True if this many tokens would blow the daily cap (can't be waited out). */
-    fun wouldExceedDaily(tokens: Long): Boolean = dailyUsed() + tokens > tpdLimit
+    fun wouldExceedDaily(tokens: Long): Boolean =
+        dailyUsed() + tokens > DAILY_WORKING_LIMIT
 
-    // ── per-minute pacing ──────────────────────────────────────────────────────
+    /**
+     * Wait until both the local rolling windows and Groq's last reported server
+     * window can accept this request. The callback receives a live countdown.
+     */
+    suspend fun awaitSlot(tokens: Long, onWaiting: (Long) -> Unit) {
+        if (tokens > MAX_REQUEST_TOKENS) {
+            throw IllegalStateException(
+                "This Groq request is too large for Qwen's 8K-token-per-minute free limit. " +
+                    "Sonario should have split it automatically; please report this source."
+            )
+        }
+        if (wouldExceedDaily(tokens)) {
+            throw IllegalStateException(
+                "Sonario's conservative daily Groq budget has been reached. " +
+                    "Your completed checkpoints are saved; continue after the daily limit resets " +
+                    "or use a Groq Developer plan."
+            )
+        }
 
-    private fun trimWindow(now: Long) {
-        while (window.isNotEmpty() && now - window.first().first >= 60_000L) {
-            window.removeFirst()
+        while (true) {
+            val waitMs = synchronized(this) { waitMillisForLocked(tokens) }
+            if (waitMs <= 0L) break
+            onWaiting(ceil(waitMs / 1000.0).toLong().coerceAtLeast(1L))
+            delay(minOf(waitMs, 1_000L))
+        }
+        onWaiting(0L)
+
+        synchronized(this) {
+            val now = System.currentTimeMillis()
+            trimLocked(now)
+            requestWindow.addLast(now)
         }
     }
 
-    private fun tokensInWindow(now: Long): Long {
-        trimWindow(now)
-        return window.sumOf { it.second }
+    /** Record actual tokens after a successful response. */
+    fun record(tokens: Long) {
+        val safe = tokens.coerceAtLeast(0L)
+        synchronized(this) {
+            val now = System.currentTimeMillis()
+            trimLocked(now)
+            tokenWindow.addLast(now to safe)
+        }
+        addDaily(safe)
     }
 
     /**
-     * Milliseconds to wait before a request costing [tokens] can be sent without
-     * exceeding the per-minute budget. 0 if it can go now.
+     * Synchronize with Groq's x-ratelimit-* token headers. These headers describe
+     * the provider's real organization-wide minute window and are more reliable
+     * than Sonario's local estimate when the same organization is used elsewhere.
      */
-    fun waitMillisFor(tokens: Long): Long {
-        val now = System.currentTimeMillis()
-        val inWindow = tokensInWindow(now)
-        if (inWindow + tokens <= tpmLimit) return 0
-        // Wait until the oldest entries age out enough to make room.
-        var needed = inWindow + tokens - tpmLimit
-        var waitUntil = now
-        for ((ts, tok) in window) {
-            needed -= tok
-            if (needed <= 0) { waitUntil = ts + 60_000L; break }
-        }
-        return (waitUntil - now).coerceAtLeast(0)
-    }
-
-    /** Suspend until a request of [tokens] can proceed; reports wait seconds. */
-    suspend fun awaitSlot(tokens: Long, onWaiting: (Long) -> Unit) {
-        var wait = waitMillisFor(tokens)
-        while (wait > 0) {
-            onWaiting((wait + 999) / 1000)  // ceil to seconds, for the UI
-            val step = minOf(wait, 1000L)
-            delay(step)
-            wait = waitMillisFor(tokens)
+    fun syncServerTokenWindow(limit: Long?, remaining: Long?, resetAfterMs: Long?) {
+        if (remaining == null || resetAfterMs == null || resetAfterMs <= 0L) return
+        synchronized(this) {
+            // Ignore obviously unrelated/invalid values, but accept account-specific
+            // limits rather than assuming every organization has the base free tier.
+            if (limit != null && limit <= 0L) return
+            serverRemainingTokens = remaining.coerceAtLeast(0L)
+            serverTokenResetAtMs = System.currentTimeMillis() + resetAfterMs
         }
     }
 
-    /** Record tokens actually spent (estimate up front, reconcile from headers). */
-    fun record(tokens: Long) {
+    fun markServerBackoff(waitMs: Long) {
+        if (waitMs <= 0L) return
+        synchronized(this) {
+            serverBlockedUntilMs = max(
+                serverBlockedUntilMs,
+                System.currentTimeMillis() + waitMs,
+            )
+        }
+    }
+
+    private fun waitMillisForLocked(tokens: Long): Long {
         val now = System.currentTimeMillis()
-        trimWindow(now)
-        window.addLast(now to tokens)
-        addDaily(tokens)
+        trimLocked(now)
+
+        var waitMs = 0L
+
+        val localTokens = tokenWindow.sumOf { it.second }
+        if (localTokens + tokens > TOKEN_WORKING_LIMIT && tokenWindow.isNotEmpty()) {
+            var needed = localTokens + tokens - TOKEN_WORKING_LIMIT
+            for ((timestamp, spent) in tokenWindow) {
+                needed -= spent
+                if (needed <= 0L) {
+                    waitMs = max(waitMs, timestamp + WINDOW_MS - now)
+                    break
+                }
+            }
+        }
+
+        if (requestWindow.size >= REQUEST_WORKING_LIMIT && requestWindow.isNotEmpty()) {
+            waitMs = max(waitMs, requestWindow.first() + WINDOW_MS - now)
+        }
+
+        if (serverBlockedUntilMs > now) {
+            waitMs = max(waitMs, serverBlockedUntilMs - now)
+        }
+
+        if (serverTokenResetAtMs <= now) {
+            serverRemainingTokens = null
+            serverTokenResetAtMs = 0L
+        } else {
+            val remaining = serverRemainingTokens
+            if (remaining != null && tokens > remaining) {
+                waitMs = max(waitMs, serverTokenResetAtMs - now)
+            }
+        }
+
+        return waitMs.coerceAtLeast(0L)
+    }
+
+    private fun trimLocked(now: Long) {
+        while (tokenWindow.isNotEmpty() && now - tokenWindow.first().first >= WINDOW_MS) {
+            tokenWindow.removeFirst()
+        }
+        while (requestWindow.isNotEmpty() && now - requestWindow.first() >= WINDOW_MS) {
+            requestWindow.removeFirst()
+        }
     }
 
     companion object {
-        /** Rough token estimate: ~4 chars per token, plus a small overhead. */
-        fun estimateTokens(text: String): Long = (text.length / 4L) + 16
+        const val PUBLISHED_TPM = 8_000L
+        const val PUBLISHED_TPD = 200_000L
+        const val PUBLISHED_RPM = 30
+
+        // Small buffers account for prompt/token-estimation error and other use in
+        // the same Groq organization.
+        const val MAX_REQUEST_TOKENS = 7_400L
+        private const val TOKEN_WORKING_LIMIT = 7_600L
+        private const val DAILY_WORKING_LIMIT = 195_000L
+        private const val REQUEST_WORKING_LIMIT = 28
+        private const val WINDOW_MS = 60_000L
+
+        /** Rough estimate: about four UTF-16 characters per model token. */
+        fun estimateTokens(text: String): Long = (text.length / 4L) + 16L
     }
 }

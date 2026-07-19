@@ -3,6 +3,7 @@ package ai.sonario.app.llm
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import ai.sonario.app.data.Settings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -26,10 +27,10 @@ import kotlin.math.min
 /**
  * Cloud inference through Groq's OpenAI-compatible chat-completions API.
  *
- * Requests are deliberately buffered before tokens are emitted. That lets Sonario
- * safely retry a request when Android briefly suspends Wi-Fi, changes networks, or
- * loses DNS while the app is in the background, without appending a duplicated
- * partial answer to the UI.
+ * Sonario's cloud path is pinned to Qwen 3.6 27B. Responses are buffered before
+ * tokens are exposed so a transient failure can be retried without duplicating a
+ * partial answer. Provider rate-limit headers are fed back into [RateLimiter],
+ * which queues the next call until Groq's real token window has reset.
  */
 class GroqEngine(
     context: Context,
@@ -66,17 +67,20 @@ class GroqEngine(
             val key = apiKeyProvider()?.trim()
                 ?.takeIf { it.isNotEmpty() }
                 ?: throw IllegalStateException("No Groq API key is set.")
-            val model = modelProvider().trim()
-            if (model.isEmpty()) throw IllegalStateException("No Groq model is selected.")
+
+            // Reading the provider performs the one-time migration of stale saved
+            // model preferences. The request itself is always pinned to Qwen.
+            modelProvider()
+            val model = Settings.DEFAULT_GROQ_MODEL
 
             val estimatedInput = RateLimiter.estimateTokens(system) +
                 RateLimiter.estimateTokens(user)
-            val estimatedTotal = estimatedInput + maxTokens
+            val estimatedTotal = estimatedInput + maxTokens.toLong()
 
             rateLimiter?.awaitSlot(estimatedTotal) { seconds ->
                 onRateWait(seconds)
             }
-            onRateWait(0)
+            onRateWait(0L)
 
             val payload = buildPayload(model, system, user, maxTokens)
             val parsed = performRequestWithRetry(key, payload, estimatedTotal)
@@ -84,8 +88,8 @@ class GroqEngine(
             rateLimiter?.record(parsed.usageTokens ?: estimatedTotal)
             onNetworkStatus(null)
 
-            // Preserve the InferenceEngine streaming contract while only exposing
-            // a response after it has completed successfully.
+            // Preserve the streaming contract while publishing only a complete,
+            // successfully buffered response.
             parsed.text.chunked(96).forEach { emit(it) }
         }.flowOn(Dispatchers.IO)
 
@@ -95,9 +99,10 @@ class GroqEngine(
         estimatedTotal: Long,
     ): ParsedCompletion {
         val media = "application/json; charset=utf-8".toMediaTypeOrNull()
-        val deadline = System.currentTimeMillis() + NETWORK_RETRY_WINDOW_MS
+        val networkDeadline = System.currentTimeMillis() + NETWORK_RETRY_WINDOW_MS
         var networkAttempt = 0
         var rateAttempt = 0
+        var serverAttempt = 0
 
         requestLoop@ while (true) {
             val request = Request.Builder()
@@ -111,46 +116,79 @@ class GroqEngine(
             val response = try {
                 http.newCall(request).execute()
             } catch (error: IOException) {
-                if (!isTransientNetworkError(error) || System.currentTimeMillis() >= deadline) {
+                if (!isTransientNetworkError(error) ||
+                    System.currentTimeMillis() >= networkDeadline
+                ) {
                     throw RuntimeException(friendlyNetworkError(error), error)
                 }
                 networkAttempt++
-                waitForConnection(networkAttempt, deadline, error)
+                waitForConnection(networkAttempt, networkDeadline, error)
                 continue@requestLoop
             }
 
             val code = response.code
             val retryAfterHeader = response.header("retry-after")
-            val resetHeader = response.header("x-ratelimit-reset-tokens")
-            val usedHeader = response.header("x-ratelimit-used-tokens")
+            val resetTokensHeader = response.header("x-ratelimit-reset-tokens")
+            val limitTokensHeader = response.header("x-ratelimit-limit-tokens")
+            val remainingTokensHeader = response.header("x-ratelimit-remaining-tokens")
+
+            val resetTokenMs = parseDurationMillis(resetTokensHeader)
+            rateLimiter?.syncServerTokenWindow(
+                limit = limitTokensHeader?.toLongOrNull(),
+                remaining = remainingTokensHeader?.toLongOrNull(),
+                resetAfterMs = resetTokenMs,
+            )
 
             val body = try {
                 response.body?.string().orEmpty()
             } catch (error: IOException) {
                 response.close()
-                if (!isTransientNetworkError(error) || System.currentTimeMillis() >= deadline) {
+                if (!isTransientNetworkError(error) ||
+                    System.currentTimeMillis() >= networkDeadline
+                ) {
                     throw RuntimeException(friendlyNetworkError(error), error)
                 }
                 networkAttempt++
-                waitForConnection(networkAttempt, deadline, error)
+                waitForConnection(networkAttempt, networkDeadline, error)
                 continue@requestLoop
             } finally {
                 response.close()
             }
 
             if (code == 429) {
+                val message = apiMessage(body)
+                if (isDailyLimit(message)) {
+                    throw RuntimeException(
+                        "Groq's organization-wide daily limit has been reached. " +
+                            "Sonario saved every completed checkpoint, so resume after Groq resets " +
+                            "the limit or use a Developer plan."
+                    )
+                }
+
                 rateAttempt++
                 if (rateAttempt > MAX_RATE_RETRIES) {
                     throw RuntimeException(friendlyError(code, body))
                 }
-                val seconds = retrySeconds(retryAfterHeader, resetHeader, body)
-                var left = seconds.coerceIn(1L, MAX_RATE_WAIT_SECONDS)
-                while (left > 0) {
-                    onRateWait(left)
-                    delay(1000)
-                    left--
-                }
-                onRateWait(0)
+
+                val waitMs = retryWaitMillis(
+                    retryAfter = retryAfterHeader,
+                    reset = resetTokensHeader,
+                    body = body,
+                ).coerceIn(1_000L, MAX_MINUTE_RATE_WAIT_MS)
+
+                rateLimiter?.markServerBackoff(waitMs)
+                waitWithCountdown(waitMs)
+                continue@requestLoop
+            }
+
+            if (code in 500..599 && serverAttempt < MAX_SERVER_RETRIES) {
+                serverAttempt++
+                val waitMs = min(30_000L, (1L shl serverAttempt) * 1_000L)
+                onNetworkStatus(
+                    "Groq had a temporary server error. Retrying in ${waitMs / 1000L}s " +
+                        "(attempt ${serverAttempt + 1})."
+                )
+                delay(waitMs)
                 continue@requestLoop
             }
 
@@ -161,15 +199,23 @@ class GroqEngine(
             val parsed = parseCompletion(body)
             if (parsed.text.isBlank()) {
                 throw RuntimeException(
-                    "Groq returned an empty answer. Check that the selected model is available, " +
-                        "then try again.")
+                    "Groq returned an empty Qwen answer. Please try again."
+                )
             }
 
-            val usage = parsed.usageTokens
-                ?: usedHeader?.toLongOrNull()
-                ?: estimatedTotal
-            return parsed.copy(usageTokens = usage)
+            return parsed.copy(usageTokens = parsed.usageTokens ?: estimatedTotal)
         }
+    }
+
+    private suspend fun waitWithCountdown(waitMs: Long) {
+        var leftMs = waitMs
+        while (leftMs > 0L) {
+            onRateWait(((leftMs + 999L) / 1_000L).coerceAtLeast(1L))
+            val step = minOf(leftMs, 1_000L)
+            delay(step)
+            leftMs -= step
+        }
+        onRateWait(0L)
     }
 
     private suspend fun waitForConnection(
@@ -177,24 +223,24 @@ class GroqEngine(
         deadline: Long,
         error: IOException,
     ) {
-        // When Android reports no validated network, wait for it to return instead
-        // of burning through retries immediately. Otherwise use exponential backoff
-        // for transient DNS/socket failures while the network still looks connected.
         if (!hasValidatedInternet()) {
             while (System.currentTimeMillis() < deadline && !hasValidatedInternet()) {
                 val remainingMinutes =
-                    ((deadline - System.currentTimeMillis()).coerceAtLeast(0) / 60_000L) + 1
+                    ((deadline - System.currentTimeMillis()).coerceAtLeast(0L) / 60_000L) + 1L
                 onNetworkStatus(
                     "Internet connection lost. Sonario is waiting and will keep retrying " +
-                        "for about $remainingMinutes more minute${if (remainingMinutes == 1L) "" else "s"}.")
+                        "for about $remainingMinutes more minute${if (remainingMinutes == 1L) "" else "s"}."
+                )
                 delay(NETWORK_POLL_MS)
             }
             if (!hasValidatedInternet()) {
                 throw RuntimeException(
-                    "The phone stayed offline too long, so Sonario could not reach Groq.", error)
+                    "The phone stayed offline too long, so Sonario could not reach Groq.",
+                    error,
+                )
             }
             onNetworkStatus("Internet is back. Reconnecting to Groq…")
-            delay(750)
+            delay(750L)
             return
         }
 
@@ -206,8 +252,9 @@ class GroqEngine(
         }
         onNetworkStatus(
             "Groq $reason. Retrying automatically in ${seconds}s " +
-                "(attempt ${attempt + 1}).")
-        delay(seconds * 1000L)
+                "(attempt ${attempt + 1})."
+        )
+        delay(seconds * 1_000L)
     }
 
     private fun hasValidatedInternet(): Boolean {
@@ -226,12 +273,17 @@ class GroqEngine(
         val messages = JSONArray()
             .put(JSONObject().put("role", "system").put("content", system))
             .put(JSONObject().put("role", "user").put("content", user))
+
         return JSONObject()
             .put("model", model)
             .put("messages", messages)
             .put("temperature", 0.35)
+            .put("top_p", 0.8)
             .put("max_tokens", maxTokens)
+            .put("reasoning_effort", "none")
+            .put("reasoning_format", "hidden")
             .put("stream", true)
+            .put("stream_options", JSONObject().put("include_usage", true))
             .toString()
     }
 
@@ -271,7 +323,8 @@ class GroqEngine(
             JSONObject(raw)
         } catch (_: Exception) {
             throw RuntimeException(
-                "Groq returned an unreadable response instead of JSON. Please try again.")
+                "Groq returned an unreadable response instead of JSON. Please try again."
+            )
         }
         apiError(obj)?.let { throw RuntimeException(it) }
         val choice = obj.optJSONArray("choices")?.optJSONObject(0)
@@ -283,11 +336,11 @@ class GroqEngine(
 
     private fun usageFrom(obj: JSONObject): Long? {
         val direct = obj.optJSONObject("usage")?.optLong("total_tokens", -1L) ?: -1L
-        if (direct >= 0) return direct
+        if (direct >= 0L) return direct
         val groq = obj.optJSONObject("x_groq")
             ?.optJSONObject("usage")
             ?.optLong("total_tokens", -1L) ?: -1L
-        return groq.takeIf { it >= 0 }
+        return groq.takeIf { it >= 0L }
     }
 
     private fun apiError(obj: JSONObject): String? {
@@ -296,26 +349,47 @@ class GroqEngine(
         return if (message.isBlank()) "Groq returned an API error." else "Groq: $message"
     }
 
-    private fun retrySeconds(retryAfter: String?, reset: String?, body: String): Long {
-        retryAfter?.trim()?.toDoubleOrNull()?.let { return it.toLong().coerceAtLeast(1) }
-        parseDurationSeconds(reset)?.let { return it }
-        val bodyMessage = try {
-            JSONObject(body).optJSONObject("error")?.optString("message")
-        } catch (_: Exception) {
-            null
-        }
-        parseDurationSeconds(bodyMessage)?.let { return it }
-        return 60L
+    private fun apiMessage(body: String): String? = try {
+        JSONObject(body).optJSONObject("error")?.optString("message")?.trim()
+    } catch (_: Exception) {
+        null
     }
 
-    /** Parses values such as "1m2.5s", "42s", or messages containing them. */
-    private fun parseDurationSeconds(value: String?): Long? {
+    private fun isDailyLimit(message: String?): Boolean {
+        val lower = message.orEmpty().lowercase()
+        return "tokens per day" in lower || "requests per day" in lower ||
+            "daily token" in lower || "daily request" in lower ||
+            Regex("\\btpd\\b").containsMatchIn(lower) ||
+            Regex("\\brpd\\b").containsMatchIn(lower)
+    }
+
+    private fun retryWaitMillis(retryAfter: String?, reset: String?, body: String): Long {
+        retryAfter?.trim()?.toDoubleOrNull()?.let {
+            return (it * 1_000.0).toLong().coerceAtLeast(1_000L)
+        }
+        parseDurationMillis(reset)?.let { return it }
+        parseDurationMillis(apiMessage(body))?.let { return it }
+        return 60_000L
+    }
+
+    /** Parses durations such as 7.66s, 1m2.5s, 2h3m, or 250ms. */
+    private fun parseDurationMillis(value: String?): Long? {
         if (value.isNullOrBlank()) return null
-        val match = DURATION_REGEX.find(value.lowercase()) ?: return null
-        val minutes = match.groups[1]?.value?.toDoubleOrNull() ?: 0.0
-        val seconds = match.groups[2]?.value?.toDoubleOrNull() ?: 0.0
-        val total = (minutes * 60.0 + seconds).toLong()
-        return total.coerceAtLeast(1)
+        var total = 0.0
+        var found = false
+        UNIT_REGEX.findAll(value.lowercase()).forEach { match ->
+            val amount = match.groupValues[1].toDoubleOrNull() ?: return@forEach
+            found = true
+            total += when (match.groupValues[2]) {
+                "d" -> amount * 86_400_000.0
+                "h" -> amount * 3_600_000.0
+                "m" -> amount * 60_000.0
+                "s" -> amount * 1_000.0
+                "ms" -> amount
+                else -> 0.0
+            }
+        }
+        return if (found) total.toLong().coerceAtLeast(1L) else null
     }
 
     private fun isTransientNetworkError(error: IOException): Boolean =
@@ -337,19 +411,16 @@ class GroqEngine(
     }
 
     private fun friendlyError(code: Int, body: String): String {
-        val message = try {
-            JSONObject(body).optJSONObject("error")?.optString("message")?.trim()
-        } catch (_: Exception) {
-            null
-        }
+        val message = apiMessage(body)
         return when (code) {
-            400 -> "Groq rejected this request" +
+            400 -> "Groq rejected this Qwen request" +
                 (if (!message.isNullOrBlank()) ": $message" else ".")
             401 -> "Groq rejected the API key. Check it in Settings."
-            403 -> "Groq denied this request. Check the API key and model access."
-            404 -> "The selected Groq model was not found. Choose a current model in Settings."
-            413 -> "This source is too large for one Groq request. Try the normal summary or a shorter source."
-            429 -> "Groq's rate limit is still active after repeated waits. Try again later or use a shorter source" +
+            403 -> "Groq denied this request. Check the API key and Qwen access."
+            404 -> "Qwen 3.6 27B is not available for this Groq account or region."
+            413 -> "This request is too large for Groq. Sonario saved the completed checkpoints."
+            429 -> "Groq's minute rate limit is still active after repeated waits. " +
+                "Your completed checkpoints are saved; try Resume shortly" +
                 (if (!message.isNullOrBlank()) ": $message" else ".")
             in 500..599 -> "Groq had a server error after automatic retries. Try again shortly."
             else -> "Groq request failed ($code)" +
@@ -358,10 +429,11 @@ class GroqEngine(
     }
 
     companion object {
-        private const val NETWORK_RETRY_WINDOW_MS = 10L * 60L * 1000L
+        private const val NETWORK_RETRY_WINDOW_MS = 10L * 60L * 1_000L
         private const val NETWORK_POLL_MS = 2_000L
         private const val MAX_RATE_RETRIES = 8
-        private const val MAX_RATE_WAIT_SECONDS = 10L * 60L
-        private val DURATION_REGEX = Regex("(?:(\\d+(?:\\.\\d+)?)m)?\\s*(\\d+(?:\\.\\d+)?)s")
+        private const val MAX_SERVER_RETRIES = 3
+        private const val MAX_MINUTE_RATE_WAIT_MS = 10L * 60L * 1_000L
+        private val UNIT_REGEX = Regex("(\\d+(?:\\.\\d+)?)\\s*(ms|d|h|m|s)\\b")
     }
 }

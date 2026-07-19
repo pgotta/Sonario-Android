@@ -5,9 +5,9 @@ import android.content.Context
 enum class EngineChoice { ON_DEVICE, GROQ }
 
 /**
- * Simple local settings, backed by SharedPreferences. Stores the engine choice,
- * the user's Groq API key, and the Groq model string. The key never leaves the
- * device except in the Authorization header of requests the user initiates.
+ * Simple local settings, backed by SharedPreferences. Stores the engine choice
+ * and the user's Groq API key. Cloud inference is intentionally pinned to one
+ * supported model so stale saved sessions cannot restore a retired model ID.
  */
 class Settings(context: Context) {
     private val prefs = context.applicationContext
@@ -24,11 +24,21 @@ class Settings(context: Context) {
         get() = prefs.getString(KEY_GROQ_KEY, null)
         set(v) = prefs.edit().putString(KEY_GROQ_KEY, v?.trim()).apply()
 
+    /**
+     * Kept as a property for saved-session compatibility, but Sonario no longer
+     * accepts an arbitrary cloud model. Reading or writing this value always
+     * migrates it to the current fixed model.
+     */
     var groqModel: String
-        get() = prefs.getString(KEY_GROQ_MODEL, DEFAULT_GROQ_MODEL)
-            ?: DEFAULT_GROQ_MODEL
-        set(v) = prefs.edit().putString(KEY_GROQ_MODEL,
-            v.trim().ifBlank { DEFAULT_GROQ_MODEL }).apply()
+        get() {
+            if (prefs.getString(KEY_GROQ_MODEL, null) != DEFAULT_GROQ_MODEL) {
+                prefs.edit().putString(KEY_GROQ_MODEL, DEFAULT_GROQ_MODEL).apply()
+            }
+            return DEFAULT_GROQ_MODEL
+        }
+        set(@Suppress("UNUSED_PARAMETER") value) {
+            prefs.edit().putString(KEY_GROQ_MODEL, DEFAULT_GROQ_MODEL).apply()
+        }
 
     val hasGroqKey: Boolean get() = !groqApiKey.isNullOrBlank()
 
@@ -36,7 +46,7 @@ class Settings(context: Context) {
         private const val KEY_ENGINE = "engine"
         private const val KEY_GROQ_KEY = "groq_api_key"
         private const val KEY_GROQ_MODEL = "groq_model"
-        // Default model. Groq's lineup changes; this is user-editable in Settings.
-        const val DEFAULT_GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+        const val DEFAULT_GROQ_MODEL = "qwen/qwen3.6-27b"
     }
 }
