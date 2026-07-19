@@ -1,0 +1,40 @@
+name: Package source ZIP
+
+on:
+  push:
+    branches:
+      - artifact/source-zip-v1.5.0
+
+permissions:
+  contents: read
+
+jobs:
+  package-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Create clean source ZIP
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/Sonario-Android-v1.5.0
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.gradle/' \
+            --exclude='build/' \
+            --exclude='*/build/' \
+            --exclude='*.apk' \
+            ./ /tmp/Sonario-Android-v1.5.0/
+          cd /tmp
+          zip -qr "$GITHUB_WORKSPACE/Sonario-Android-v1.5.0.zip" Sonario-Android-v1.5.0
+
+      - name: Upload source ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sonario-Android-v1.5.0-source
+          path: Sonario-Android-v1.5.0.zip
+          if-no-files-found: error
+          retention-days: 7
