@@ -12,8 +12,8 @@ android {
         applicationId = "ai.sonario.app"
         minSdk = 28          // Android 9. 8 Elite phones are far above this.
         targetSdk = 36
-        versionCode = 9
-        versionName = "1.3.3"
+        versionCode = 10
+        versionName = "1.4.0"
         vectorDrawables { useSupportLibrary = true }
         ndk { abiFilters += "arm64-v8a" }  // modern phones; keeps APK lean
     }
@@ -69,4 +69,7 @@ dependencies {
     // On-device LLM via llama.cpp, through the Llamatik Maven library.
     // No NDK, no native build: it ships prebuilt arm64 binaries.
     implementation("com.llamatik:library-android:1.7.0")
+
+    // Secure API key storage (hardware-backed encryption for BYOK credentials).
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
 }
