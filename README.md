@@ -1,115 +1,110 @@
 # Sonario for Android
 
-An on-device / cloud **source summariser** powered by large language models.
-Summarise web articles, YouTube videos, EPUBs, PDFs, or pasted text with a
-single tap.
+Summarize YouTube videos, web articles, and pasted text on your phone. Paste a
+link (or share one into the app) and get skimmable notes, a detailed prose view,
+or a bulleted outline — powered by the AI provider **you** choose.
 
-> **v2.0** — Now with multi-provider BYOK: OpenAI, Anthropic, Groq, Ollama,
-> and any OpenAI-compatible proxy. Bring your own API key, stored encrypted
-> via Android Keystore.
+## What's new in 1.4.0
 
----
+Sonario is now a **bring-your-own-key (BYOK) multi-provider** app:
+
+- **Any provider** — Groq, OpenAI, Anthropic (Claude), Ollama, or any
+  OpenAI-compatible proxy — from one settings screen.
+- **Hardware-backed key storage** — your API keys are encrypted with an
+  AES-256-GCM key in the Android Keystore. They never leave the device except
+  in the `Authorization` header of requests **you** initiate.
+- **Per-provider model + base URL + temperature** — pick the model, set a
+  custom endpoint (self-hosted, proxy, local Ollama), and tune randomness.
+- **On-device still included** — run a GGUF model locally for full privacy.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list and [docs/BYOK.md](docs/BYOK.md)
+for setup instructions.
 
 ## Features
 
-- **Two engines**
-  - **On-device** — GGUF models via llama.cpp. No data ever leaves your phone.
-  - **Cloud** — any major LLM provider, true streaming responses.
-- **Five cloud providers**
-  - OpenAI · Anthropic · Groq · Ollama · Custom (OpenAI-compatible proxy)
-- **BYOK (bring-your-own-key)**
-  - API keys are encrypted with AES-256-GCM via the Android Keystore.
-  - Keys never leave the device except in the request you initiate.
-- **Multiple source types**
-  - Web articles, YouTube (transcript), EPUB, PDF, DOCX, pasted text.
-- **Export** — save summaries as Markdown, plain text, or PDF.
-- **Local sessions** — recent summaries are persisted on-device.
-- **Configurable** — per-provider model, base URL, temperature, max tokens.
+- **YouTube transcripts** — multi-route extraction (get_transcript, Android
+  player, WEB player, watch-page captions) with consent handling.
+- **Web articles** — fetched and cleaned with Jsoup.
+- **Local files** — PDF, EPUB, DOCX, TXT, MD via the system file picker.
+- **Three summary views** — Normal (skimmable Markdown), Detailed (prose),
+  Bullets (outline), plus per-chapter for EPUBs.
+- **Ask** — question-answering grounded in the source with `[n]` citations.
+- **Resumable** — summaries checkpoint after each section; kill the app and
+  resume without re-spending tokens.
+- **Export** — TXT, Markdown, or PDF via the Storage Access Framework.
+- **On-device** — runs a GGUF model via Llamatik (llama.cpp) with no NDK.
 
----
+## Getting started
 
-## Setup
+1. Clone the repo and open in Android Studio (Hedgehog or newer).
+2. Run on a device or emulator (API 28+).
+3. On first launch, choose:
+   - **Cloud** — pick a provider, paste your API key, pick a model.
+   - **On-device** — download a GGUF model (1–2 GB, use Wi-Fi).
+
+## BYOK setup
+
+Each provider needs an API key. Get one, then paste it in
+**Settings → Providers**.
+
+| Provider  | Free tier | Key location |
+|-----------|-----------|--------------|
+| Groq      | ✅        | console.groq.com |
+| OpenAI    | —         | platform.openai.com/api-keys |
+| Anthropic | —         | console.anthropic.com |
+| Ollama    | ✅ (local) | no key needed |
+| Custom    | —         | your proxy |
+
+See [docs/BYOK.md](docs/BYOK.md) for step-by-step instructions.
+
+## Build
 
 ```bash
-git clone https://github.com/stupidgiraffe/Sonario-Android.git
-cd Sonario-Android
 ./gradlew assembleDebug
 ```
 
-Install `app/build/outputs/apk/debug/app-debug.apk` on your phone.
-
-### First-run
-1. Open the app → tap the gear icon.
-2. Choose **On-device** or **Cloud**.
-3. If you chose Cloud, pick a provider and paste your API key.
-4. Pick a model and start summarising.
-
-### Getting API keys
-
-| Provider | Key format | Where to get one |
-|----------|-----------|-----------------|
-| OpenAI | `sk-…` | <https://platform.openai.com/api-keys> |
-| Anthropic | `sk-ant-…` | <https://console.anthropic.com/settings/keys> |
-| Groq | `gsk_…` | <https://console.groq.com/keys> |
-| Ollama | *(none)* | <https://ollama.com/> |
-| Custom | *(varies)* | Your proxy / self-hosted |
-
----
+See [BUILD.md](BUILD.md) for details.
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  UI  (Jetpack Compose, Material 3)                        │
-│  ├─ SummaryScreen ──────────────────────────┐            │
-│  ├─ SettingsScreen (provider picker, BYOK)  │            │
-│  └─ SetupScreen / ModelsScreen              │            │
-└─────────────────────────────────────────────┼────────────┘
-                                              │
-┌─────────────────────────────────────────────┼────────────┐
-│  ViewModel                                   │            │
-│  ├─ SummaryViewModel                         │            │
-│  │   ├─ settings: Settings ──────┐           │            │
-│  │   ├─ currentEngine()          │           │            │
-│  │   └─ loadFromUrl/File/Text()  │           │            │
-└─────────────────────────────────────────────┼────────────┘
-                  │                           │
-┌─────────────────┼───────────────────────────┼────────────┐
-│  Engine layer    │                           │            │
-│  ├─ InferenceEngine (interface)              │            │
-│  ├─ LlmEngine     (on-device, llama.cpp)     │            │
-│  └─ CloudEngine   (OpenAI / Anthropic /      │            │
-│                    Groq / Ollama / Custom)    │            │
-└──────────────────────────────────────────────┼────────────┘
-                  │                           │
-┌─────────────────┼───────────────────────────┼────────────┐
-│  Data layer      │                           │            │
-│  ├─ Settings (per-provider config)           │            │
-│  ├─ SecureStorage (encrypted API keys)       │            │
-│  ├─ SessionStore (recent summaries)          │            │
-│  └─ Exporter (MD / TXT / PDF)                │            │
-└──────────────────────────────────────────────────────────┘
+│  UI (Jetpack Compose, Material 3)                         │
+│  SummaryScreen · SetupScreen · SettingsScreen · Models   │
+└────────────────────────┬─────────────────────────────────┘
+                         │
+┌────────────────────────▼─────────────────────────────────┐
+│  SummaryViewModel                                        │
+│  (engine selection, session state, progress)             │
+└──────┬───────────────────────────────┬───────────────────┘
+       │                               │
+┌──────▼────────┐            ┌─────────▼──────────────────┐
+│  LlmEngine    │            │  CloudEngine               │
+│  (on-device)  │            │  (Groq/OpenAI/Anthropic/   │
+│  Llamatik /   │            │   Ollama / Custom)         │
+│  llama.cpp    │            │  ↳ SecureStorage (keys)    │
+└───────────────┘            └────────────────────────────┘
+       │                               │
+┌──────▼───────────────────────────────▼──────────────────┐
+│  SummarizeEngine (map-reduce, chunk, condense, derive)   │
+└─────────────────────────────────────────────────────────┘
 ```
 
----
+- **`InferenceEngine`** — small interface; `LlmEngine` (on-device) and
+  `CloudEngine` (any provider) both implement it.
+- **`CloudEngine`** — one implementation, many providers. Reads
+  `ProviderConfig` (model, base URL, temperature) and the API key from
+  `SecureStorage`.
+- **`SecureStorage`** — AES-256-GCM via Android Keystore. Keys never stored
+  in plaintext.
+- **`SessionStore`** — durable, resumable sessions on disk.
+- **`SourceFetcher`** — YouTube (multi-route), web articles, pasted text.
 
-## Privacy
+## Contributing
 
-- **On-device mode**: no network access is required or performed. All
-  processing runs locally via llama.cpp.
-- **Cloud mode**: the source text is sent to the provider you choose, in the
-  request you actively initiate. API keys are stored encrypted on-device
-  with hardware-backed AES-256-GCM. Sonario does not proxy, log, or collect
-  your keys or data.
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports and feature requests go
+through the templates in `.github/ISSUE_TEMPLATE/`.
 
 ## License
 
-Same license as the original pgotta/Sonario-Android project.
-
----
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for the full v2.0.0 release notes.
+MIT — see [LICENSE](LICENSE).
