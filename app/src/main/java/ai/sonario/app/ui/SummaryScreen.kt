@@ -123,7 +123,7 @@ fun SummaryScreen(
                 Text(
                     if (cloud)
                         "Paste a YouTube link, an article URL, or text. Your text is " +
-                            "sent to ${ui.cloudProvider.displayName}'s cloud to summarize."
+                            "sent to the cloud to summarize."
                     else
                         "Paste a YouTube link, an article URL, or text. On-device: " +
                             "nothing leaves your phone except the fetch.",
@@ -239,7 +239,7 @@ private fun InputCard(ui: UiState, vm: SummaryViewModel) {
                     label = {
                         val isCloud = ui.engineChoice == EngineChoice.CLOUD
                         Text(
-                            if (isCloud) "${ui.cloudProvider.displayName}: ${shortModel(ui.providerModel)}"
+                            if (isCloud) "Cloud"
                             else ui.model.label,
                             maxLines = 1,
                             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
@@ -313,9 +313,8 @@ private fun RecentSessionsCard(ui: UiState, vm: SummaryViewModel) {
             title = { Text("Clear all recent sessions?") },
             text = {
                 Text(
-                    "This permanently deletes every saved session, transcript/source " +
-                        "file, chapter record, summary, checkpoint, and saved question " +
-                        "from this device. Exported files outside Sonario are not deleted."
+                    "This permanently deletes every saved session and " +
+                        "summary from this device."
                 )
             },
             confirmButton = {
@@ -485,10 +484,10 @@ private fun ProgressCard(ui: UiState, vm: SummaryViewModel) {
             if (ui.rateWaitSeconds > 0) {
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Pacing for the rate limit, resuming in ${ui.rateWaitSeconds}s. " +
-                        "Large videos are sent in timed batches so they don't get blocked.",
+                    "Pacing for the rate limit, resuming in ${ui.rateWaitSeconds}s.",
                     color = SonarioColors.Teal,
-                    style = MaterialTheme.typography.bodyMedium)
+                    style = MaterialTheme.typography.bodyMedium,
+                )
             }
 
             Spacer(Modifier.height(10.dp))
@@ -539,7 +538,6 @@ private fun ResultArea(
         Column(Modifier.padding(16.dp)) {
             val focusManager = LocalFocusManager.current
             val bringIntoView = remember { BringIntoViewRequester() }
-            val scope = rememberCoroutineScope()
 
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(res.title.ifBlank { "Summary" },
@@ -765,11 +763,6 @@ private fun approxMinutes(minutes: Int?) {
             color = SonarioColors.Muted,
             style = MaterialTheme.typography.labelMedium)
     }
-}
-
-private fun shortModel(model: String): String {
-    val parts = model.split("/")
-    return parts.lastOrNull() ?: model
 }
 
 private fun stripMd(md: String): String {
