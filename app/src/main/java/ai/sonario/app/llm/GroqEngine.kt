@@ -30,7 +30,13 @@ import kotlin.math.min
  * safely retry a request when Android briefly suspends Wi-Fi, changes networks, or
  * loses DNS while the app is in the background, without appending a duplicated
  * partial answer to the UI.
+ *
+ * @deprecated Use [CloudEngine] with [LlmProvider.GROQ] instead. CloudEngine
+ *   supports Groq plus OpenAI, Anthropic, Ollama, and any OpenAI-compatible
+ *   proxy, with the same retry / rate-limit handling. This class is kept for
+ *   reference but is no longer wired into the app.
  */
+@Deprecated("Use CloudEngine with LlmProvider.GROQ", ReplaceWith("CloudEngine(context, { ProviderConfig(LlmProvider.GROQ, model) }, { key }, rateLimiter)"))
 class GroqEngine(
     context: Context,
     private val apiKeyProvider: () -> String?,
@@ -162,7 +168,8 @@ class GroqEngine(
             if (parsed.text.isBlank()) {
                 throw RuntimeException(
                     "Groq returned an empty answer. Check that the selected model is available, " +
-                        "then try again.")
+                        "then try again."
+                )
             }
 
             val usage = parsed.usageTokens
@@ -177,21 +184,20 @@ class GroqEngine(
         deadline: Long,
         error: IOException,
     ) {
-        // When Android reports no validated network, wait for it to return instead
-        // of burning through retries immediately. Otherwise use exponential backoff
-        // for transient DNS/socket failures while the network still looks connected.
         if (!hasValidatedInternet()) {
             while (System.currentTimeMillis() < deadline && !hasValidatedInternet()) {
                 val remainingMinutes =
                     ((deadline - System.currentTimeMillis()).coerceAtLeast(0) / 60_000L) + 1
                 onNetworkStatus(
                     "Internet connection lost. Sonario is waiting and will keep retrying " +
-                        "for about $remainingMinutes more minute${if (remainingMinutes == 1L) "" else "s"}.")
+                        "for about $remainingMinutes more minute${if (remainingMinutes == 1L) "" else "s"}."
+                )
                 delay(NETWORK_POLL_MS)
             }
             if (!hasValidatedInternet()) {
                 throw RuntimeException(
-                    "The phone stayed offline too long, so Sonario could not reach Groq.", error)
+                    "The phone stayed offline too long, so Sonario could not reach Groq.", error
+                )
             }
             onNetworkStatus("Internet is back. Reconnecting to Groq…")
             delay(750)
@@ -206,7 +212,8 @@ class GroqEngine(
         }
         onNetworkStatus(
             "Groq $reason. Retrying automatically in ${seconds}s " +
-                "(attempt ${attempt + 1}).")
+                "(attempt ${attempt + 1})."
+        )
         delay(seconds * 1000L)
     }
 
@@ -271,7 +278,8 @@ class GroqEngine(
             JSONObject(raw)
         } catch (_: Exception) {
             throw RuntimeException(
-                "Groq returned an unreadable response instead of JSON. Please try again.")
+                "Groq returned an unreadable response instead of JSON. Please try again."
+            )
         }
         apiError(obj)?.let { throw RuntimeException(it) }
         val choice = obj.optJSONArray("choices")?.optJSONObject(0)
