@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - artifact/source-zip-v1.5.0
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
