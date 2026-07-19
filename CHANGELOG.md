@@ -2,6 +2,23 @@
 
 All notable changes to Sonario for Android are documented here.
 
+## 1.4.0
+
+- Replaces the retired Llama 4 Scout cloud model with the fixed Groq model
+  `qwen/qwen3.6-27b`.
+- Automatically ignores and migrates stale model IDs stored by older installs or
+  saved sessions.
+- Resizes cloud chunks and output budgets so each request fits beneath Qwen's
+  free-tier 8K-token-per-minute limit.
+- Queues requests against conservative local TPM, RPM, and daily budgets instead
+  of repeatedly hitting minute-based 429 errors.
+- Reads Groq's live remaining-token and reset headers and displays a countdown
+  while waiting for the provider's actual token window.
+- Detects organization-wide daily exhaustion, stops without retrying all day, and
+  preserves completed checkpoints for Resume.
+- Uses Qwen's non-thinking mode for routine summaries to reduce unnecessary token
+  consumption.
+
 ## 1.3.3
 
 - Keeps the Ask field visible when the software keyboard opens.
