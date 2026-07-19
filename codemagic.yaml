@@ -4,11 +4,6 @@ workflows:
     max_build_duration: 60
     environment:
       java: 17
-    cache:
-      cache_paths:
-        - ~/.gradle/caches
-        - ~/.gradle/wrapper
-        - ~/.android/build-cache
     triggering:
       events:
         - push
