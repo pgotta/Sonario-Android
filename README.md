@@ -6,7 +6,7 @@ or a bulleted outline.
 
 **Status:** working. YouTube transcript summarization, web-article and pasted-text
 summarization, Groq cloud, on-device inference, saved sessions, resumable
-checkpoints, and source Q&A are functional as of version 1.4.0.
+checkpoints, and source Q&A are functional as of version 1.5.0.
 
 Sonario has two engines, and you pick which to use per summary:
 
@@ -14,9 +14,9 @@ Sonario has two engines, and you pick which to use per summary:
   with Qwen 3.6 27B. Sonario splits large sources into rate-safe requests, waits
   for Groq's minute windows, and checkpoints each completed call. You bring your
   own API key. Your text goes to Groq's servers.
-- **On-device** - runs a model locally via llama.cpp. Private (nothing leaves the
-  phone except fetching the link), but slow: CPU-only, so a summary takes minutes
-  and the phone warms up. A private fallback rather than the daily driver.
+- **On-device** - runs a downloaded GGUF locally through llama.cpp. Source text
+  remains private after Sonario fetches it, but phone inference is slower than
+  Groq and can warm the device during long summaries.
 
 ## Highlights
 
@@ -26,6 +26,8 @@ Sonario has two engines, and you pick which to use per summary:
   IDs from being restored by an old setting or saved session.
 - Queues cloud requests against conservative TPM/RPM limits and Groq's live reset
   headers instead of repeatedly failing with minute-based 429 errors.
+- Offers three newer local choices with clear quality/speed tradeoffs: Qwen3 4B,
+  Gemma 3n E4B, and LFM2 2.6B.
 - Keeps long cloud summaries alive with a foreground service and retries
   temporary DNS, timeout, and network-handoff failures.
 - Saves up to 12 recent sessions locally, restores the latest session on launch,
@@ -53,8 +55,8 @@ Sonario has two engines, and you pick which to use per summary:
 ## Quick start (Groq cloud, the fast path)
 
 1. Install the APK (see below) and open Sonario.
-2. On the first screen, tap **Use Groq cloud instead** (skips the local-model
-   download).
+2. On the first screen, tap **Use Groq cloud instead** to skip the local-model
+   download.
 3. Get a Groq API key at console.groq.com and create a key.
 4. In Sonario's Settings, paste the key and tap **Save key**.
 5. Back on the main screen, make sure the toggle is on **Groq cloud**, paste a
@@ -68,11 +70,13 @@ keys in the same organization share the same quota and do not multiply it.
 
 ## Quick start (on-device, fully private)
 
-1. Open Sonario. On the first screen, tap **Get** on a model (Qwen2.5 1.5B is the
-   fastest). It downloads in-app (~1 GB, use Wi-Fi).
-2. When it finishes, make sure the toggle is on **On-device**, paste a source,
-   and tap **Summarize**. Expect it to take a few minutes; the CPU meter at the
-   bottom-left will sit near 100%.
+1. Open Sonario and choose a local model:
+   - **Qwen3 4B Instruct 2507** for the strongest overall local summaries and Q&A.
+   - **Gemma 3n E4B Instruct** for nuanced long-form summaries and writing.
+   - **LFM2 2.6B** for the smallest download and fastest local responses.
+2. Tap **Get** and keep the phone on Wi-Fi. Downloads range from about 1.6 GB to
+   4.3 GB.
+3. When it finishes, select **On-device**, paste a source, and tap **Summarize**.
 
 ## Supported links
 
@@ -95,7 +99,7 @@ The two engines differ, and the app shows which is active:
   one-time model download and fetching whatever link you paste.
 - Groq cloud: the text to summarize is sent to Groq. Don't use this for anything
   you wouldn't send to a third-party API. Your Groq key is stored only on your
-  device (local app storage) and is sent solely to Groq.
+  device and is sent solely to Groq.
 
 ## How YouTube transcripts are fetched
 
@@ -148,26 +152,33 @@ build 2** diagnostics so you can confirm the new APK is actually installed.
   entered, and the app no longer treats a failed Ask call as a successful generic
   answer.
 
-## On-device models (downloaded on first run, not bundled)
+## On-device models (downloaded, never bundled)
 
-| Model | Size | Notes |
-| --- | --- | --- |
-| Qwen2.5 1.5B Instruct | ~1.1 GB | Fastest on-device; the default |
-| Llama 3.2 3B Instruct | ~2.0 GB | Better output, slower |
-| Phi-3.5 Mini Instruct | ~2.3 GB | Larger context, slowest |
+| Model | Download | Best for | Tradeoff |
+| --- | ---: | --- | --- |
+| Qwen3 4B Instruct 2507 Q4_K_M | ~2.5 GB | Best overall local summaries, comprehension, and follow-up answers | Slower than LFM2 |
+| Gemma 3n E4B Instruct Q4_K_M | ~4.24 GB | Nuanced long-form summaries and polished writing | Largest and slowest option |
+| LFM2 2.6B Q4_K_M | ~1.56 GB | Fast summaries, extraction, and lower storage use | Weaker on difficult or subtle material |
 
-Q4_K_M GGUF from public Hugging Face repos, downloaded at first launch to
-`Android/data/ai.sonario.app/files/models/`. Never bundled in the APK.
+Sonario downloads the GGUF files from public Hugging Face repositories into
+`filesDir/models`, Android's private app-specific storage. The app checks free
+space before starting, supports resumable downloads, and removes obsolete models
+from versions 1.4 and earlier.
 
-On-device inference is CPU-only: the llama.cpp build here has no Adreno GPU
-backend, so on a Snapdragon phone every token is generated on CPU. It works and
-is genuinely private, but Groq is far more practical for everyday use.
+Android deletes app-specific files when Sonario is uninstalled. Sonario also sets
+`hasFragileUserData=false` and excludes `models/` from cloud backup and
+phone-to-phone transfer, so multi-gigabyte model files are not retained or
+restored after reinstall.
+
+The app uses Llamatik 1.8.1, an Android wrapper around llama.cpp. It requests
+available acceleration but may fall back to CPU depending on the device and the
+runtime build. Local models remain useful for privacy and offline work, while the
+27B Groq model remains substantially stronger and faster for everyday use.
 
 ## Crash diagnostics
 
-If the app ever crashes, it writes the stack trace to
-`Android/data/ai.sonario.app/files/last_crash.txt` and shows it on the next
-launch (with a Copy button) instead of silently closing.
+If the app ever crashes, it writes the stack trace to its private app files and
+shows it on the next launch with a Copy button instead of silently closing.
 
 ## Architecture
 
@@ -178,18 +189,17 @@ and the summarize pipeline talks only to that:
 - `llm/LlmEngine.kt` - on-device via Llamatik/llama.cpp.
 - `llm/GroqEngine.kt` - Qwen 3.6 through Groq's OpenAI-compatible streaming API.
 - `llm/RateLimiter.kt` - local pacing plus synchronization with Groq reset headers.
-- `llm/ModelDownloader.kt` - resumable GGUF download.
+- `llm/ModelDownloader.kt` - resumable GGUF downloads with free-space checks.
 - `data/Settings.kt` - engine choice and Groq key (local preferences).
 - `source/SourceFetcher.kt` - YouTube (InnerTube) and web-article fetching.
 - `summarize/SummarizeEngine.kt` - map-reduce summarizer with bounded cloud calls
-  sized for Groq's TPM limits and small CPU-bounded on-device chunks.
+  and small, phone-safe local chunks.
 - `summarize/Prompts.kt` - prompts carried over from Sonario desktop.
-- `ui/` - Compose screens, theme, settings, the CPU/RAM meter, crash screen.
+- `ui/` - Compose screens, theme, settings, system meter, and crash screen.
 - `CrashReporter.kt` - global uncaught-exception logger.
 
-To add another backend (e.g. a self-hosted llama.cpp/Ollama server on a PC),
-implement `InferenceEngine` and hand it to `SummarizeEngine`. `GroqEngine` is the
-template for an HTTP-based engine.
+To add another backend, implement `InferenceEngine` and hand it to
+`SummarizeEngine`. `GroqEngine` is the template for an HTTP-based engine.
 
 ## Build
 
