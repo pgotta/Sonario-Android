@@ -10,12 +10,12 @@ android {
 
     defaultConfig {
         applicationId = "ai.sonario.app"
-        minSdk = 28          // Android 9. 8 Elite phones are far above this.
+        minSdk = 28
         targetSdk = 36
-        versionCode = 10
-        versionName = "1.4.0"
+        versionCode = 11
+        versionName = "1.5.0"
         vectorDrawables { useSupportLibrary = true }
-        ndk { abiFilters += "arm64-v8a" }  // modern phones; keeps APK lean
+        ndk { abiFilters += "arm64-v8a" }
     }
 
     buildTypes {
@@ -54,19 +54,17 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
     implementation("androidx.navigation:navigation-compose:2.8.1")
 
-    // Networking for source fetching (YouTube captions, web articles)
+    // Networking for source fetching and resumable model downloads.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    // HTML parsing for web-article extraction (the Jsoup analogue of BeautifulSoup)
     implementation("org.jsoup:jsoup:1.18.1")
 
-    // PDF text extraction for the local-file picker.
+    // Local document extraction.
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
 
-    // Markdown rendering for the summary view (core + Material 3 module).
+    // Markdown rendering for summary output.
     implementation("com.mikepenz:multiplatform-markdown-renderer:0.27.0")
     implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.27.0")
 
-    // On-device LLM via llama.cpp, through the Llamatik Maven library.
-    // No NDK, no native build: it ships prebuilt arm64 binaries.
-    implementation("com.llamatik:library-android:1.7.0")
+    // Latest Llamatik/llama.cpp Android runtime for Qwen3, Gemma 3n and LFM2 GGUFs.
+    implementation("com.llamatik:library-android:1.8.1")
 }
