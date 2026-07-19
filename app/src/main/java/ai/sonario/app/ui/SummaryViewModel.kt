@@ -5,15 +5,16 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import ai.sonario.app.SummaryService
 import ai.sonario.app.data.EngineChoice
-import ai.sonario.app.data.Settings
 import ai.sonario.app.data.SessionPreview
 import ai.sonario.app.data.SessionStatus
 import ai.sonario.app.data.SessionStore
+import ai.sonario.app.data.Settings
 import ai.sonario.app.data.StoredQa
 import ai.sonario.app.data.SummarySession
 import ai.sonario.app.llm.BUNDLED_MODELS
-import ai.sonario.app.llm.GroqEngine
+import ai.sonario.app.llm.CloudEngine
 import ai.sonario.app.llm.LlmEngine
+import ai.sonario.app.llm.LlmProvider
 import ai.sonario.app.llm.ModelDownloader
 import ai.sonario.app.llm.ModelInfo
 import ai.sonario.app.llm.RateLimiter
@@ -33,10 +34,8 @@ import kotlinx.coroutines.launch
 
 enum class SummaryView { NORMAL, DETAILED, BULLETS, CHAPTER }
 
-/** One question and its cited answer, for the ask box. */
 data class QaPair(val question: String, val answer: String)
 
-/** What the model download is doing right now, for the picker UI. */
 data class DownloadState(
     val model: ModelInfo? = null,
     val bytes: Long = 0,
@@ -69,8 +68,9 @@ data class UiState(
     val download: DownloadState = DownloadState(),
     // engine + cloud settings
     val engineChoice: EngineChoice = EngineChoice.ON_DEVICE,
-    val groqKeySet: Boolean = false,
-    val groqModel: String = Settings.DEFAULT_GROQ_MODEL,
+    val cloudProvider: LlmProvider = LlmProvider.GROQ,
+    val providerKeySet: Boolean = false,
+    val providerModel: String = "",
     // Durable local sessions.
     val activeSessionId: String? = null,
     val recentSessions: List<SessionPreview> = emptyList(),
@@ -86,20 +86,10 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
     private val settings = Settings(app)
     private val sessionStore = SessionStore(app)
     private val rateLimiter = RateLimiter(app)
-    private val groq = GroqEngine(
-        context = app,
-        apiKeyProvider = { settings.groqApiKey },
-        modelProvider = { settings.groqModel },
-        rateLimiter = rateLimiter,
-        onRateWait = { seconds -> onRateWait(seconds) },
-        onNetworkStatus = { message -> onNetworkStatus(message) },
-    )
 
     private var downloadJob: Job? = null
 
     // Long-running work is process-scoped rather than Activity/ViewModel-scoped.
-    // A recreated Activity reconnects to the same StateFlow and job instead of
-    // starting over and spending the same tokens again.
     private var summaryJob: Job?
         get() = processSummaryJob
         set(value) { processSummaryJob = value }
@@ -118,7 +108,6 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
 
     private val appCtx = app.applicationContext
 
-    /** Keep the process foreground-priority so long jobs survive backgrounding. */
     private fun startKeepAlive(text: String) {
         runCatching { SummaryService.start(appCtx, text) }
     }
@@ -126,7 +115,6 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
         runCatching { SummaryService.stop(appCtx) }
     }
 
-    /** A requested export the Activity should fulfil by opening the file picker. */
     data class PendingExport(
         val format: ai.sonario.app.data.Exporter.Format,
         val title: String,
@@ -144,6 +132,27 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearPendingExport() { _pendingExport.value = null }
 
+    // ── cloud engine factory ───────────────────────────────────────────────────
+
+    private fun makeCloudEngine(provider: LlmProvider): CloudEngine {
+        val cfg = settings.configFor(provider)
+        return CloudEngine(
+            context = app,
+            configProvider = { cfg },
+            apiKeyProvider = { settings.keyFor(provider) },
+            rateLimiter = rateLimiter,
+            onRateWait = { seconds -> onRateWait(seconds) },
+            onNetworkStatus = { message -> onNetworkStatus(message) },
+        )
+    }
+
+    private fun makeSummarizer(engine: EngineChoice, provider: LlmProvider): SummarizeEngine {
+        return when (engine) {
+            EngineChoice.ON_DEVICE -> SummarizeEngine(llm, bigContext = false)
+            EngineChoice.CLOUD -> SummarizeEngine(makeCloudEngine(provider), bigContext = true)
+        }
+    }
+
     // ── ask a question about the summarized source ──────────────────────────────
 
     fun ask(question: String): Boolean {
@@ -152,7 +161,8 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
         val summarizer = lastSummarizer
         if (summarizer == null || lastSourceText.isBlank()) {
             _ui.value = _ui.value.copy(
-                askError = "Ask is available after Sonario finishes a summary.")
+                askError = "Ask is available after Sonario finishes a summary."
+            )
             return false
         }
 
@@ -180,7 +190,6 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
                     refreshSessionPreviewsNow()
                 }
             } catch (_: CancellationException) {
-                // User/app lifecycle cancellation is not an error to display.
             } catch (error: Exception) {
                 _ui.value = _ui.value.copy(
                     askError = friendlyFailure(
@@ -205,14 +214,12 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
 
     private val extractor = FileTextExtractor(app)
 
-    /** Set true to ask the Activity to open the system file picker. */
     private val _pickFile = MutableStateFlow(false)
     val pickFile: StateFlow<Boolean> = _pickFile.asStateFlow()
 
     fun requestPickFile() { _pickFile.value = true }
     fun clearPickFile() { _pickFile.value = false }
 
-    /** Called by the Activity with the picked file's Uri. Extracts + summarizes. */
     fun onFilePicked(uri: android.net.Uri) {
         _pickFile.value = false
         if (_ui.value.busy) return
@@ -220,7 +227,7 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
         val state = _ui.value
         val model = state.model
         if (!validateEngine(state.engineChoice, model)) return
-        val summarizer = makeSummarizer(state.engineChoice)
+        val summarizer = makeSummarizer(state.engineChoice, state.cloudProvider)
         attachProgress(summarizer)
 
         var session = sessionStore.save(SummarySession(
@@ -229,7 +236,8 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
             kind = "Document",
             engineChoice = state.engineChoice,
             modelFileName = model.fileName,
-            groqModel = state.groqModel,
+            cloudProviderId = state.cloudProvider.id,
+            cloudModel = state.providerModel,
             phase = "reading file",
         ))
         prepareUiForSession(session)
@@ -307,12 +315,11 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Called from the Groq engine while it waits for a rate-limit slot. */
     private fun onRateWait(seconds: Long) {
         _ui.value = _ui.value.copy(rateWaitSeconds = seconds)
         if (seconds > 0 && (seconds <= 5 || seconds % 10L == 0L)) {
             runCatching {
-                SummaryService.update(appCtx, "Waiting for Groq rate limit (${seconds}s)…")
+                SummaryService.update(appCtx, "Waiting for rate limit (${seconds}s)…")
             }
         }
     }
@@ -325,20 +332,16 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Tokens used today against the free-tier daily cap, for display. */
     fun groqDailyUsage(): Pair<Long, Long> {
         val u = rateLimiter.dailyUsage()
         return u.used to u.limit
     }
 
-    /** Manually clear the app's daily token tally (e.g. if it drifts). */
     fun resetDailyBudget() {
         rateLimiter.resetDaily()
-        // nudge UI to re-read
         _ui.value = _ui.value.copy()
     }
 
-    /** Build a human-readable estimate line and put it in the UI (Groq only). */
     private fun setEstimate(sourceText: String) {
         val e = rateLimiter.estimate(sourceText)
         val tokens = formatCount(e.totalTokens)
@@ -377,10 +380,7 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         val shouldRestore = synchronized(PROCESS_LOCK) {
-            if (restoreStarted) false else {
-                restoreStarted = true
-                true
-            }
+            if (restoreStarted) false else { restoreStarted = true; true }
         }
         if (shouldRestore) restoreRecentSessions()
     }
@@ -413,25 +413,25 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
             ?: _ui.value.model
         val canResume = session.sourceText.isNotBlank() && session.result == null
         val interrupted = session.status == SessionStatus.RUNNING && processSummaryJob?.isActive != true
+        val provider = LlmProvider.fromId(session.cloudProviderId)
         val notice = when {
-            session.result != null && restoredAtLaunch ->
-                "Restored your most recent summary."
-            interrupted ->
-                "This summary was interrupted, but its completed sections were saved. Resume continues from the last checkpoint."
-            session.status == SessionStatus.FAILED && canResume ->
-                "The previous run stopped, but its completed sections were saved. You can resume without starting over."
-            session.status == SessionStatus.CANCELLED && canResume ->
-                "This session was cancelled. Completed sections are still saved and resumable."
+            session.result != null && restoredAtLaunch -> "Restored your most recent summary."
+            interrupted -> "This summary was interrupted, but its completed sections were saved. Resume continues from the last checkpoint."
+            session.status == SessionStatus.FAILED && canResume -> "The previous run stopped, but its completed sections were saved. You can resume without starting over."
+            session.status == SessionStatus.CANCELLED && canResume -> "This session was cancelled. Completed sections are still saved and resumable."
             else -> ""
         }
 
         settings.engine = session.engineChoice
-        if (session.engineChoice == EngineChoice.GROQ && session.groqModel.isNotBlank()) {
-            settings.groqModel = session.groqModel
+        if (session.engineChoice == EngineChoice.CLOUD) {
+            settings.cloudProvider = provider
+            if (session.cloudModel.isNotBlank()) {
+                settings.setModelFor(provider, session.cloudModel)
+            }
         }
         lastSourceText = session.sourceText
         lastSummarizer = if (session.sourceText.isNotBlank()) {
-            makeSummarizer(session.engineChoice)
+            makeSummarizer(session.engineChoice, provider)
         } else null
 
         _ui.value = _ui.value.copy(
@@ -459,7 +459,9 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
             models = models,
             hasAnyModel = models.any { it.present },
             engineChoice = session.engineChoice,
-            groqModel = session.groqModel,
+            cloudProvider = provider,
+            providerKeySet = settings.keyFor(provider)?.let { true } ?: false,
+            providerModel = if (session.cloudModel.isNotBlank()) session.cloudModel else settings.modelFor(provider),
             activeSessionId = session.id,
             resumeAvailable = canResume && processSummaryJob?.isActive != true,
             sessionNotice = notice,
@@ -494,7 +496,6 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Permanently delete all locally saved sessions and their source files. */
     fun clearAllSessions() {
         if (_ui.value.busy || _ui.value.asking) return
         PROCESS_SCOPE.launch {
@@ -503,86 +504,218 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
             lastSummarizer = null
             _ui.value = _ui.value.copy(
                 activeSessionId = null,
-                recentSessions = emptyList(),
-                resumeAvailable = false,
-                sessionNotice = "Recent sessions and saved source data were cleared.",
-                qaHistory = emptyList(),
                 result = null,
-                view = SummaryView.NORMAL,
+                qaHistory = emptyList(),
+                resumeAvailable = false,
+                sessionNotice = "",
                 error = null,
-                askError = null,
-                phase = "",
-                progressCurrent = 0,
-                progressTotal = 0,
-                liveText = "",
-                estimateText = "",
-                networkStatus = "",
-                rateWaitSeconds = 0,
+                recentSessions = emptyList(),
             )
         }
     }
 
-    fun resumeSession(id: String? = _ui.value.activeSessionId) {
-        if (id == null || _ui.value.busy || _ui.value.asking) return
-        PROCESS_SCOPE.launch {
-            val loaded = sessionStore.load(id) ?: return@launch
-            if (loaded.result != null) {
-                applySession(loaded)
-                return@launch
-            }
-            if (loaded.sourceText.isBlank()) {
+    // ── engine / provider actions ───────────────────────────────────────────────
+
+    fun setEngine(choice: EngineChoice) {
+        settings.engine = choice
+        _ui.value = _ui.value.copy(engineChoice = choice)
+    }
+
+    fun setCloudProvider(provider: LlmProvider) {
+        settings.cloudProvider = provider
+        _ui.value = _ui.value.copy(
+            cloudProvider = provider,
+            providerKeySet = settings.hasKeyFor(provider),
+            providerModel = settings.modelFor(provider),
+        )
+    }
+
+    fun setProviderKey(key: String, provider: LlmProvider) {
+        settings.setKeyFor(provider, key)
+        _ui.value = _ui.value.copy(providerKeySet = settings.hasKeyFor(provider))
+    }
+
+    fun setProviderModel(model: String, provider: LlmProvider) {
+        settings.setModelFor(provider, model)
+        _ui.value = _ui.value.copy(providerModel = model)
+    }
+
+    fun setCustomBaseUrl(url: String, provider: LlmProvider) {
+        settings.setCustomBaseUrlFor(provider, url)
+    }
+
+    fun setTemperature(value: Float, provider: LlmProvider) {
+        settings.setTemperatureFor(provider, value)
+    }
+
+    fun maskedKey(provider: LlmProvider): String =
+        SecureStorage.masked(settings.keyFor(provider))
+
+    // ── summarize flow ─────────────────────────────────────────────────────────
+
+    fun onInput(text: String) {
+        _ui.value = _ui.value.copy(input = text)
+    }
+
+    fun summarize() {
+        val input = _ui.value.input.trim()
+        if (input.isEmpty() || _ui.value.busy) return
+        val state = _ui.value
+        val model = state.model
+        if (!validateEngine(state.engineChoice, model)) return
+        val summarizer = makeSummarizer(state.engineChoice, state.cloudProvider)
+        attachProgress(summarizer)
+
+        var session = sessionStore.save(SummarySession(
+            input = input,
+            title = "Summarizing…",
+            kind = "Source",
+            engineChoice = state.engineChoice,
+            modelFileName = model.fileName,
+            cloudProviderId = state.cloudProvider.id,
+            cloudModel = state.providerModel,
+            phase = "fetching",
+        ))
+        prepareUiForSession(session)
+        startKeepAlive("Summarizing…")
+
+        summaryJob?.cancel()
+        summaryJob = PROCESS_SCOPE.launch {
+            try {
+                val fetched = fetcher.fetch(input)
+                if (fetched.error != null) throw IllegalStateException(fetched.error)
+                session = sessionStore.save(session.copy(
+                    input = fetched.title.ifBlank { input },
+                    title = fetched.title.ifBlank { "Summary" },
+                    kind = fetched.kind,
+                    sourceText = fetched.text,
+                    approxMinutes = fetched.approxMinutes,
+                    phase = "chunking",
+                ))
                 _ui.value = _ui.value.copy(
-                    error = "This session stopped before the source was saved, so it cannot be resumed.")
-                return@launch
-            }
-            if (!validateEngine(loaded.engineChoice, modelFor(loaded))) return@launch
-
-            val session = sessionStore.save(loaded.copy(
-                status = SessionStatus.RUNNING,
-                error = null,
-                phase = loaded.phase.ifBlank { "resuming" },
-            ))
-            settings.engine = session.engineChoice
-            if (session.engineChoice == EngineChoice.GROQ) {
-                settings.groqModel = session.groqModel
-            }
-            val summarizer = makeSummarizer(session.engineChoice)
-            val model = modelFor(session)
-            attachProgress(summarizer)
-            prepareUiForSession(session, "Resuming from saved checkpoint…")
-            startKeepAlive("Resuming ${session.title}…")
-
-            summaryJob?.cancel()
-            summaryJob = PROCESS_SCOPE.launch {
+                    input = fetched.title.ifBlank { input },
+                    activeSessionId = session.id,
+                    phase = "chunking",
+                )
+                refreshSessionPreviewsNow()
                 runPreparedSession(session, summarizer, model)
+            } catch (_: CancellationException) {
+                handleCancellation(session)
+            } catch (error: Exception) {
+                handleFailure(session, error)
             }
         }
     }
 
-    private fun modelFor(session: SummarySession): ModelInfo {
-        val models = llm.availableModels()
-        return models.firstOrNull { it.fileName == session.modelFileName }
-            ?: _ui.value.model
+    private suspend fun runPreparedSession(
+        session: SummarySession,
+        summarizer: SummarizeEngine,
+        model: ModelInfo,
+    ) {
+        val result = summarizer.run(
+            model = model,
+            text = session.sourceText,
+            title = session.title,
+            kind = session.kind,
+            approxMinutes = session.approxMinutes,
+            initialCheckpoint = session.checkpoint,
+            onCheckpoint = { cp ->
+                sessionStore.save(session.copy(checkpoint = cp))
+            },
+        )
+        val saved = sessionStore.save(session.copy(
+            status = SessionStatus.COMPLETE,
+            result = result,
+            phase = "done",
+        ))
+        _ui.value = _ui.value.copy(
+            busy = false,
+            result = result,
+            activeSessionId = saved.id,
+            resumeAvailable = false,
+            sessionNotice = "Summary complete.",
+            liveText = "",
+            error = null,
+        )
+        refreshSessionPreviewsNow()
+        SummaryService.complete(appCtx, "Summary of ${result.title} is ready")
+        progressJob?.cancel()
+        progressJob = null
+        summaryJob = null
     }
 
-    private fun makeSummarizer(choice: EngineChoice): SummarizeEngine =
-        if (choice == EngineChoice.GROQ)
-            SummarizeEngine(groq, bigContext = true)
-        else
-            SummarizeEngine(llm, bigContext = false)
+    private suspend fun handleCancellation(session: SummarySession) {
+        val saved = sessionStore.save(session.copy(
+            status = SessionStatus.CANCELLED,
+            phase = _ui.value.phase,
+            progressCurrent = _ui.value.progressCurrent,
+            progressTotal = _ui.value.progressTotal,
+        ))
+        _ui.value = _ui.value.copy(
+            busy = false,
+            activeSessionId = saved.id,
+            resumeAvailable = saved.sourceText.isNotBlank(),
+            sessionNotice = if (saved.sourceText.isNotBlank())
+                "Stopped. Completed sections were saved."
+            else "Stopped before finishing.",
+            liveText = "",
+            error = null,
+        )
+        refreshSessionPreviewsNow()
+        SummaryService.stop(appCtx)
+        progressJob?.cancel()
+        progressJob = null
+        summaryJob = null
+    }
 
-    private fun validateEngine(choice: EngineChoice, model: ModelInfo): Boolean {
-        if (choice == EngineChoice.GROQ && !settings.hasGroqKey) {
-            _ui.value = _ui.value.copy(
-                error = "This session used Groq, but no Groq API key is currently set.")
-            return false
+    private suspend fun handleFailure(session: SummarySession, error: Exception) {
+        val message = friendlyFailure(error, "The summary failed.")
+        val saved = sessionStore.save(session.copy(
+            status = SessionStatus.FAILED,
+            phase = _ui.value.phase,
+            progressCurrent = _ui.value.progressCurrent,
+            progressTotal = _ui.value.progressTotal,
+            error = message,
+        ))
+        _ui.value = _ui.value.copy(
+            busy = false,
+            error = message,
+            activeSessionId = saved.id,
+            resumeAvailable = saved.sourceText.isNotBlank(),
+            sessionNotice = if (saved.sourceText.isNotBlank())
+                "Completed sections were saved. You can resume."
+            else "",
+            liveText = "",
+        )
+        refreshSessionPreviewsNow()
+        SummaryService.failed(appCtx, "Summary stopped: ${saved.title}")
+        progressJob?.cancel()
+        progressJob = null
+        summaryJob = null
+    }
+
+    private fun validateEngine(engine: EngineChoice, model: ModelInfo): Boolean {
+        return when (engine) {
+            EngineChoice.ON_DEVICE -> {
+                if (!llm.isModelPresent(model)) {
+                    _ui.value = _ui.value.copy(
+                        error = "No on-device model downloaded. Get one in Models."
+                    )
+                    return false
+                }
+                true
+            }
+            EngineChoice.CLOUD -> {
+                val provider = _ui.value.cloudProvider
+                if (provider.needsKey && !settings.hasKeyFor(provider)) {
+                    _ui.value = _ui.value.copy(
+                        error = "No ${provider.displayName} API key. Add one in Settings → Providers."
+                    )
+                    return false
+                }
+                true
+            }
         }
-        if (choice == EngineChoice.ON_DEVICE && !llm.isModelPresent(model)) {
-            _ui.value = _ui.value.copy(
-                error = "The on-device model used by this session is not installed.")
-            return false
-        }
-        return true
     }
 
     private fun attachProgress(summarizer: SummarizeEngine) {
@@ -590,433 +723,86 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
         progressJob = PROCESS_SCOPE.launch {
             summarizer.progress.collect { p ->
                 _ui.value = _ui.value.copy(
+                    busy = p.phase != "done",
                     phase = p.phase,
                     progressCurrent = p.current,
                     progressTotal = p.total,
                     liveText = p.live,
-                    rateWaitSeconds = if (p.live.isNotBlank()) 0 else _ui.value.rateWaitSeconds,
                 )
             }
         }
     }
 
-    private fun prepareUiForSession(session: SummarySession, notice: String = "") {
+    private fun prepareUiForSession(session: SummarySession) {
         _ui.value = _ui.value.copy(
-            input = session.input,
             busy = true,
             error = null,
             result = null,
-            phase = session.phase,
+            qaHistory = emptyList(),
             liveText = "",
-            rateWaitSeconds = 0,
-            networkStatus = "",
-            estimateText = "",
-            askError = null,
-            qaHistory = session.qaHistory.map { QaPair(it.question, it.answer) },
-            engineChoice = session.engineChoice,
-            groqModel = session.groqModel,
+            phase = "fetching",
+            progressCurrent = 0,
+            progressTotal = 0,
             activeSessionId = session.id,
             resumeAvailable = false,
-            sessionNotice = notice,
+            sessionNotice = "",
         )
-        refreshSessionPreviewsNow()
     }
 
-    private suspend fun runPreparedSession(
-        initial: SummarySession,
-        summarizer: SummarizeEngine,
-        model: ModelInfo,
-    ) {
-        var session = initial
-        try {
-            if (session.engineChoice == EngineChoice.GROQ) {
-                val cp = session.checkpoint
-                val hasSavedWork = cp.notes.isNotEmpty() || cp.normal.isNotBlank() ||
-                    cp.bullets.isNotBlank() || cp.detailed.isNotBlank() ||
-                    cp.detailedParts.isNotEmpty() || cp.chapterParts.isNotEmpty()
-                if (hasSavedWork) {
-                    _ui.value = _ui.value.copy(
-                        estimateText = "Resuming from a local checkpoint. Completed model calls will be skipped.")
-                } else {
-                    setEstimate(session.sourceText)
-                }
-            }
-            var checkpoint = session.checkpoint
-            var result = summarizer.run(
-                model = model,
-                text = session.sourceText,
-                title = session.title,
-                kind = session.kind,
-                approxMinutes = session.approxMinutes,
-                initialCheckpoint = checkpoint,
-                onCheckpoint = { saved ->
-                    checkpoint = saved
-                    session = sessionStore.save(session.copy(
-                        status = SessionStatus.RUNNING,
-                        phase = _ui.value.phase,
-                        progressCurrent = _ui.value.progressCurrent,
-                        progressTotal = _ui.value.progressTotal,
-                        checkpoint = saved,
-                        error = null,
-                    ))
-                    refreshSessionPreviewsNow()
-                },
+    fun resumeSession(id: String? = null) {
+        PROCESS_SCOPE.launch {
+            val sessionId = id ?: _ui.value.activeSessionId ?: return@launch
+            val session = sessionStore.load(sessionId) ?: return@launch
+            val model = _ui.value.models.firstOrNull { it.fileName == session.modelFileName }
+                ?: _ui.value.model
+            val provider = LlmProvider.fromId(session.cloudProviderId)
+            val summarizer = makeSummarizer(session.engineChoice, provider)
+            attachProgress(summarizer)
+            _ui.value = _ui.value.copy(
+                busy = true, error = null, liveText = "", sessionNotice = "",
             )
+            runPreparedSession(session, summarizer, model)
+        }
+    }
 
-            if (session.chapters.isNotEmpty()) {
-                val chapterText = summarizer.summarizeChapters(
-                    chapters = session.chapters,
-                    bookOverview = result.normal,
-                    existingParts = checkpoint.chapterParts,
-                    onCheckpoint = { parts ->
-                        checkpoint = checkpoint.copy(chapterParts = parts)
-                        session = sessionStore.save(session.copy(
-                            status = SessionStatus.RUNNING,
-                            phase = "chapters",
-                            progressCurrent = parts.size,
-                            progressTotal = session.chapters.size,
-                            checkpoint = checkpoint,
-                        ))
-                        refreshSessionPreviewsNow()
-                    },
-                )
-                result = result.copy(chapters = chapterText)
-            }
+    fun cancel() {
+        summaryJob?.cancel()
+        askJob?.cancel()
+    }
 
-            session = sessionStore.save(session.copy(
-                status = SessionStatus.COMPLETE,
-                phase = "done",
-                progressCurrent = 0,
-                progressTotal = 0,
-                checkpoint = checkpoint,
-                result = result,
-                error = null,
-            ))
-            lastSourceText = session.sourceText
-            lastSummarizer = summarizer
-            _ui.value = _ui.value.copy(
-                busy = false,
-                result = result,
-                view = SummaryView.NORMAL,
-                phase = "done",
-                liveText = "",
-                rateWaitSeconds = 0,
-                networkStatus = "",
-                estimateText = "",
-                qaHistory = session.qaHistory.map { QaPair(it.question, it.answer) },
-                activeSessionId = session.id,
-                resumeAvailable = false,
-                sessionNotice = "Saved locally in Recent sessions.",
-                error = null,
-            )
-            refreshSessionPreviewsNow()
-            SummaryService.complete(appCtx, "Summary ready: ${session.title}")
-        } catch (_: CancellationException) {
-            session = sessionStore.save(session.copy(
-                status = SessionStatus.CANCELLED,
-                phase = _ui.value.phase,
-                progressCurrent = _ui.value.progressCurrent,
-                progressTotal = _ui.value.progressTotal,
-                error = null,
-            ))
-            _ui.value = _ui.value.copy(
-                busy = false,
-                liveText = "",
-                networkStatus = "",
-                rateWaitSeconds = 0,
-                activeSessionId = session.id,
-                resumeAvailable = session.sourceText.isNotBlank(),
-                sessionNotice = "Stopped. Completed sections were saved and can be resumed.",
-                error = null,
-            )
-            refreshSessionPreviewsNow()
-            SummaryService.stop(appCtx)
-        } catch (error: Exception) {
-            val message = friendlyFailure(error, "The summary failed.")
-            session = sessionStore.save(session.copy(
-                status = SessionStatus.FAILED,
-                phase = _ui.value.phase,
-                progressCurrent = _ui.value.progressCurrent,
-                progressTotal = _ui.value.progressTotal,
-                error = message,
-            ))
-            _ui.value = _ui.value.copy(
-                busy = false,
-                liveText = "",
-                networkStatus = "",
-                rateWaitSeconds = 0,
-                error = message,
-                activeSessionId = session.id,
-                resumeAvailable = session.sourceText.isNotBlank(),
-                sessionNotice = if (session.sourceText.isNotBlank())
-                    "Completed sections were saved. Resume will continue from the checkpoint."
-                else "",
-            )
-            refreshSessionPreviewsNow()
-            SummaryService.failed(appCtx, "Summary stopped: ${session.title}")
-        } finally {
-            progressJob?.cancel()
-            progressJob = null
-            summaryJob = null
-            _ui.value = _ui.value.copy(networkStatus = "", rateWaitSeconds = 0)
+    private fun friendlyFailure(error: Exception, fallback: String): String {
+        val msg = error.message?.trim()
+        return when {
+            msg.isNullOrBlank() -> fallback
+            else -> msg
         }
     }
 
     private fun initialState(): UiState {
         val models = llm.availableModels()
-        val present = models.firstOrNull { it.present }
+        val hasAny = models.any { it.present }
+        val engine = settings.engine
+        val provider = settings.cloudProvider
         return UiState(
             models = models,
-            hasAnyModel = present != null,
-            model = present ?: models.first(),
-            engineChoice = settings.engine,
-            groqKeySet = settings.hasGroqKey,
-            groqModel = settings.groqModel,
+            hasAnyModel = hasAny,
+            model = models.firstOrNull { it.present } ?: BUNDLED_MODELS.first(),
+            engineChoice = engine,
+            cloudProvider = provider,
+            providerKeySet = settings.hasKeyFor(provider),
+            providerModel = settings.modelFor(provider),
         )
-    }
-
-    fun onInput(s: String) {
-        _ui.value = _ui.value.copy(input = s, error = null)
-    }
-
-    fun clearAskError() {
-        if (_ui.value.askError != null) {
-            _ui.value = _ui.value.copy(askError = null)
-        }
-    }
-    fun setView(v: SummaryView) { _ui.value = _ui.value.copy(view = v) }
-    fun setModel(m: ModelInfo) { _ui.value = _ui.value.copy(model = m) }
-
-    fun refreshModels() {
-        val models = llm.availableModels()
-        _ui.value = _ui.value.copy(
-            models = models,
-            hasAnyModel = models.any { it.present },
-        )
-    }
-
-    // ── engine + cloud settings ────────────────────────────────────────────────
-
-    fun setEngine(choice: EngineChoice) {
-        if (_ui.value.busy || _ui.value.asking) return
-        settings.engine = choice
-        _ui.value = _ui.value.copy(engineChoice = choice, error = null)
-    }
-
-    fun setGroqKey(key: String) {
-        val changed = key.trim() != (settings.groqApiKey ?: "")
-        settings.groqApiKey = key
-        // A new key has its own fresh daily budget on Groq's side.
-        if (changed) rateLimiter.resetDaily()
-        _ui.value = _ui.value.copy(groqKeySet = settings.hasGroqKey)
-    }
-
-    fun setGroqModel(model: String) {
-        settings.groqModel = model
-        _ui.value = _ui.value.copy(groqModel = settings.groqModel)
-    }
-
-    fun currentGroqKeyMasked(): String {
-        val k = settings.groqApiKey ?: return ""
-        return if (k.length <= 8) "••••" else k.take(4) + "…" + k.takeLast(4)
-    }
-
-    // ── model download (first-run picker + Models screen) ──────────────────────
-
-    fun downloadModel(model: ModelInfo) {
-        if (_ui.value.download.active) return
-        _ui.value = _ui.value.copy(
-            download = DownloadState(model = model, active = true))
-        downloadJob = viewModelScope.launch {
-            downloader.download(model).collect { st ->
-                when (st) {
-                    is ModelDownloader.State.Progress ->
-                        _ui.value = _ui.value.copy(
-                            download = _ui.value.download.copy(
-                                bytes = st.bytes, total = st.total))
-                    is ModelDownloader.State.Done -> {
-                        val models = llm.availableModels()
-                        _ui.value = _ui.value.copy(
-                            models = models,
-                            hasAnyModel = true,
-                            model = models.firstOrNull { it.fileName == model.fileName }
-                                ?: model,
-                            download = DownloadState(),
-                        )
-                    }
-                    is ModelDownloader.State.Failed ->
-                        _ui.value = _ui.value.copy(
-                            download = DownloadState(model = model, error = st.message))
-                }
-            }
-        }
-    }
-
-    fun cancelDownload() {
-        downloadJob?.cancel()
-        downloadJob = null
-        _ui.value = _ui.value.copy(download = DownloadState())
-    }
-
-    // ── summarize ──────────────────────────────────────────────────────────────
-
-    fun summarize() {
-        val state = _ui.value
-        if (state.input.isBlank() || state.busy) return
-
-        val model = state.model
-        if (!validateEngine(state.engineChoice, model)) return
-        val summarizer = makeSummarizer(state.engineChoice)
-        attachProgress(summarizer)
-
-        var session = sessionStore.save(SummarySession(
-            input = state.input,
-            title = state.input.lineSequence().firstOrNull()?.take(80)
-                ?.ifBlank { "New summary" } ?: "New summary",
-            kind = "Source",
-            engineChoice = state.engineChoice,
-            modelFileName = model.fileName,
-            groqModel = state.groqModel,
-            phase = "fetching",
-        ))
-        prepareUiForSession(session)
-        startKeepAlive("Fetching source…")
-
-        summaryJob?.cancel()
-        summaryJob = PROCESS_SCOPE.launch {
-            try {
-                val src = fetcher.fetch(state.input)
-                if (!src.ok) {
-                    throw IllegalStateException(src.error ?: "Could not read that source.")
-                }
-                session = sessionStore.save(session.copy(
-                    title = src.title,
-                    kind = src.kind,
-                    approxMinutes = src.approxMinutes,
-                    sourceText = src.text,
-                    phase = "chunking",
-                ))
-                _ui.value = _ui.value.copy(
-                    activeSessionId = session.id,
-                    phase = "chunking",
-                )
-                refreshSessionPreviewsNow()
-                runPreparedSession(session, summarizer, model)
-            } catch (_: CancellationException) {
-                val saved = sessionStore.save(session.copy(
-                    status = SessionStatus.CANCELLED,
-                    phase = _ui.value.phase,
-                    progressCurrent = _ui.value.progressCurrent,
-                    progressTotal = _ui.value.progressTotal,
-                ))
-                _ui.value = _ui.value.copy(
-                    busy = false,
-                    activeSessionId = saved.id,
-                    resumeAvailable = saved.sourceText.isNotBlank(),
-                    sessionNotice = if (saved.sourceText.isNotBlank())
-                        "Stopped. The source and completed sections were saved."
-                    else "Stopped before the source finished loading.",
-                    liveText = "",
-                    error = null,
-                )
-                refreshSessionPreviewsNow()
-                SummaryService.stop(appCtx)
-                progressJob?.cancel()
-                progressJob = null
-                summaryJob = null
-            } catch (error: Exception) {
-                val message = friendlyFailure(error, "The summary failed.")
-                val saved = sessionStore.save(session.copy(
-                    status = SessionStatus.FAILED,
-                    phase = _ui.value.phase,
-                    progressCurrent = _ui.value.progressCurrent,
-                    progressTotal = _ui.value.progressTotal,
-                    error = message,
-                ))
-                _ui.value = _ui.value.copy(
-                    busy = false,
-                    error = message,
-                    activeSessionId = saved.id,
-                    resumeAvailable = saved.sourceText.isNotBlank(),
-                    sessionNotice = if (saved.sourceText.isNotBlank())
-                        "The source and completed sections were saved. You can resume."
-                    else "",
-                    liveText = "",
-                )
-                refreshSessionPreviewsNow()
-                SummaryService.failed(appCtx, "Summary stopped: ${saved.title}")
-                progressJob?.cancel()
-                progressJob = null
-                summaryJob = null
-            }
-        }
-    }
-
-    fun cancelSummary() {
-        val job = summaryJob
-        if (job?.isActive == true) {
-            job.cancel()
-            return
-        }
-        _ui.value = _ui.value.copy(
-            busy = false,
-            phase = "",
-            liveText = "",
-            rateWaitSeconds = 0,
-            networkStatus = "",
-            error = null,
-        )
-        stopKeepAlive()
-    }
-
-    private fun friendlyFailure(error: Throwable, fallback: String): String {
-        val message = error.message?.trim().orEmpty()
-        return when {
-            message.isNotBlank() -> message
-            else -> "$fallback (${error.javaClass.simpleName})"
-        }
-    }
-
-    override fun onCleared() {
-        // Do not cancel process-scoped summary/ask work here. Android may destroy
-        // and recreate the Activity while the foreground task is still running.
-        downloadJob?.cancel()
-        super.onCleared()
-    }
-
-    fun reset() {
-        askJob?.cancel()
-        askJob = null
-        stopKeepAlive()
-        _ui.value = _ui.value.copy(
-            result = null,
-            error = null,
-            input = "",
-            phase = "",
-            liveText = "",
-            qaHistory = emptyList(),
-            askError = null,
-            networkStatus = "",
-            rateWaitSeconds = 0,
-            activeSessionId = null,
-            resumeAvailable = false,
-            sessionNotice = "",
-        )
-        lastSourceText = ""
-        lastSummarizer = null
-        refreshSessionPreviews()
     }
 
     companion object {
+        private val PROCESS_SCOPE = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val PROCESS_LOCK = Any()
-        private val PROCESS_SCOPE = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
         @Volatile private var processUi: MutableStateFlow<UiState>? = null
         @Volatile private var processSummaryJob: Job? = null
         @Volatile private var processAskJob: Job? = null
         @Volatile private var processProgressJob: Job? = null
         @Volatile private var processLastSourceText: String = ""
         @Volatile private var processLastSummarizer: SummarizeEngine? = null
-        @Volatile private var restoreStarted: Boolean = false
+        @Volatile private var restoreStarted = false
     }
 }
