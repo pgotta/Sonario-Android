@@ -64,8 +64,8 @@ fun SettingsScreen(vm: SummaryViewModel, onBack: () -> Unit) {
             Spacer(Modifier.height(10.dp))
             EngineOption(
                 title = "On-device",
-                subtitle = "Runs the model on your phone. Private, but slow " +
-                    "(CPU only). Needs a downloaded model.",
+                subtitle = "Runs a downloaded model privately on your phone. " +
+                    "No source text is sent to an AI provider.",
                 selected = ui.engineChoice == EngineChoice.ON_DEVICE,
                 onClick = { vm.setEngine(EngineChoice.ON_DEVICE) },
             )
@@ -197,7 +197,7 @@ fun SettingsScreen(vm: SummaryViewModel, onBack: () -> Unit) {
             HorizontalDivider(color = SonarioColors.RuleSoft)
             Spacer(Modifier.height(12.dp))
             Text(
-                "Sonario 1.4.0 • Qwen 3.6 cloud and rate-aware queueing",
+                "Sonario 1.5.0 • mobile-focused local model choices",
                 color = SonarioColors.Muted,
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -250,7 +250,6 @@ private fun EngineOption(
     }
 }
 
-/** Compact token count: 480000 -> "480K", 1200000 -> "1.2M". */
 private fun fmtK(n: Long): String = when {
     n >= 1_000_000 -> String.format("%.1fM", n / 1_000_000.0)
     n >= 1_000 -> "${n / 1000}K"
