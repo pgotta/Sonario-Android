@@ -52,7 +52,8 @@ class MainActivity : ComponentActivity() {
                 val context = androidx.compose.ui.platform.LocalContext.current
                 val exportLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
                     androidx.activity.result.contract.ActivityResultContracts.CreateDocument(
-                        "*/*")
+                        "*/*"
+                    )
                 ) { uri ->
                     val p = pending
                     if (uri != null && p != null) {
@@ -108,7 +109,7 @@ class MainActivity : ComponentActivity() {
                         SetupScreen(vm, onUseCloud = {
                             // Switching to the cloud engine ends the setup state;
                             // land on Settings so the user can paste their key.
-                            vm.setEngine(EngineChoice.GROQ)
+                            vm.setEngine(EngineChoice.CLOUD)
                             screen = Screen.SETTINGS
                         })
                     else -> SummaryScreen(

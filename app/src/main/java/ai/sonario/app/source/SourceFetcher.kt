@@ -16,6 +16,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import org.jsoup.parser.Parser
 import java.util.concurrent.TimeUnit
+import java.io.IOException
 import kotlin.math.ceil
 
 /**
@@ -32,6 +33,7 @@ import kotlin.math.ceil
  * HTTP 200 with an empty body even when the video visibly had captions.
  */
 class SourceFetcher {
+    private var lastCaptionDiag: String = ""
 
     private val cookieJar = MemoryCookieJar()
 
@@ -239,8 +241,7 @@ class SourceFetcher {
             ?: contextClient?.optString("clientVersion")?.takeIf { it.isNotBlank() }
             ?: FALLBACK_WEB_CLIENT_VERSION
         val visitorData = extractJsonConfigString(response.body, "VISITOR_DATA")
-            ?: contextClient?.optString("visitorData")
-            ?: ""
+            ?: contextClient?.optString("visitorData") ?: ""
         val title = extractTitleFromWatchHtml(response.body)
 
         diagnostics += "bootstrap=key:${if (apiKey.isBlank()) "none" else "page"}" +
@@ -759,7 +760,7 @@ class SourceFetcher {
 
     private fun extractTitleFromWatchHtml(html: String): String {
         // Try og:title first, then <title>.
-        val og = Regex("<meta\s+property=\"og:title\"\s+content=\"([^\"]*)\"").find(html)
+        val og = Regex("<meta\\s+property=\"og:title\"\\s+content=\"([^\"]*)\"").find(html)
         if (og != null) return decodeJsonString(og.groupValues[1]).trim()
         val title = Regex("<title>([^<]*)</title>").find(html)
         if (title != null) {
@@ -806,8 +807,8 @@ class SourceFetcher {
 
     private fun extractConsentValue(html: String): String? {
         val patterns = listOf(
-            "action=\"https://consent\.youtube\.com/s\\?([^\"]*)\"",
-            "action=\"https://consent\.youtube\.com/s([^^\"]*)\"",
+            "action=\"https://consent\\.youtube\\.com/s\\?([^\"]*)\"",
+            "action=\"https://consent\\.youtube\\.com/s([^^\"]*)\"",
         )
         for (p in patterns) {
             val m = Regex(p).find(html) ?: continue
@@ -937,8 +938,8 @@ class SourceFetcher {
         }
     }
 
-    private fun normalizeWhitespace(s: String): String =
-        s.replace(Regex("\\s+"), " ").trim()
+    private fun String.normalizeWhitespace(): String =
+        replace(Regex("\\s+"), " ").trim()
 
     private fun minutesFromMs(ms: Long): Int = ceil(ms / 60000.0).toInt()
 
@@ -950,7 +951,7 @@ class SourceFetcher {
 
     private fun diagnosticMessage(e: Exception): String = e.message
         ?.replace(';', ',')
-        .replace('\n', ' ')
+        .replace('\\n', ' ')
         ?.take(180) ?: e.javaClass.simpleName
 
     private fun watchUrl(videoId: String): String =
