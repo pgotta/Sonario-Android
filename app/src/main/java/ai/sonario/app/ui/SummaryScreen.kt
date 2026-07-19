@@ -1,5 +1,7 @@
 package ai.sonario.app.ui
 
+// Focal v1.4.0 - restored original SummaryScreen
+
 import ai.sonario.app.R
 import ai.sonario.app.data.EngineChoice
 import ai.sonario.app.data.Exporter
@@ -74,10 +76,8 @@ fun SummaryScreen(
                             modifier = Modifier.size(30.dp),
                         )
                         Spacer(Modifier.width(8.dp))
-                        Text("Sonar", style = MaterialTheme.typography.titleLarge,
+                        Text("Focal", style = MaterialTheme.typography.titleLarge,
                             color = SonarioColors.Ink)
-                        Text("io", style = MaterialTheme.typography.titleLarge,
-                            color = SonarioColors.Green)
                     }
                 },
                 navigationIcon = {
