@@ -16,25 +16,25 @@ import kotlinx.coroutines.flow.collect
  * generated all views up front so the UI could toggle instantly.
  *
  * The engine is an InferenceEngine, so this works with the on-device model or
- * the Groq cloud engine. Chunking adapts: on-device models have a small (~4k
- * token) context so chunks are small and the total work is hard-capped; the
- * cloud path (Llama 4 Scout, 128k context) uses much larger chunks and rarely
- * needs to chunk at all.
+ * the Groq cloud engine. Cloud chunks are intentionally much smaller than
+ * Qwen's 131k context window because Groq's free tier limits the organization
+ * to 8k tokens per minute. Each individual request must fit comfortably inside
+ * that minute budget before the rate limiter queues the next request.
  */
 class SummarizeEngine(
     private val engine: InferenceEngine,
     private val bigContext: Boolean = false,
 ) {
 
-    // On-device: ~2800 chars/chunk (~800 tokens). Cloud: much larger, since a
-    // 128k-context model swallows most sources in one or a few passes.
-    private val chunkChars = if (bigContext) 40000 else 2800
-    private val singlePassLimit = if (bigContext) 120000 else 3200
+    // Qwen cloud calls stay below the 8K TPM ceiling even after prompt and output
+    // tokens are included. On-device chunks remain small for CPU performance.
+    private val chunkChars = if (bigContext) 14000 else 2800
+    private val singlePassLimit = if (bigContext) 16000 else 3200
 
-    // Work cap. On-device this bounds runtime (CPU is slow). Cloud can afford
-    // more passes, but we still cap so a giant book stays within rate limits.
-    private val maxChunks = if (bigContext) 40 else 20
-    private val maxChunkChars = if (bigContext) 48000 else 6000
+    // Fourteen cloud chunks keep a full Normal + Detailed run within roughly one
+    // free-tier daily allowance while still covering long videos/documents.
+    private val maxChunks = if (bigContext) 14 else 20
+    private val maxChunkChars = if (bigContext) 16000 else 6000
 
     data class Progress(
         val phase: String,      // "fetching" | "chunking" | "condensing" | "synthesizing" | "deriving" | "done"
@@ -163,7 +163,10 @@ class SummarizeEngine(
             val ch = chapters[i]
             _progress.value = Progress("chapters", i + 1, chapters.size)
             val summary = runCatching {
-                Cleaner.clean(streamCollect(Prompts.CHAPTER, source(ch.text), maxTokens = 300))
+                val boundedChapter = ch.text.take(singlePassLimit)
+                Cleaner.clean(
+                    streamCollect(Prompts.CHAPTER, source(boundedChapter), maxTokens = 300)
+                )
             }.getOrDefault("")
             val section = buildString {
                 append("## ${ch.title}\n\n")
@@ -186,14 +189,13 @@ class SummarizeEngine(
     /**
      * Answer a question grounded in the source text, with inline [n] citations.
      * The source is chunked into numbered excerpts so the model can cite them;
-     * for very long sources we cap how much is sent (cloud can take a lot).
+     * for very long sources we select relevant passages from across the source.
      */
     suspend fun answer(question: String, sourceText: String): String {
         _progress.value = Progress("answering", 0, 1)
 
-        // Do not blindly send only the beginning of a long video/book. Select the
-        // passages most relevant to the question from across the entire source,
-        // while keeping the prompt comfortably inside the model context window.
+        // Keep the Qwen request under the same free-tier TPM budget used by the
+        // summary pipeline while still sampling relevant material across the source.
         val excerpts = selectRelevantExcerpts(question, sourceText)
         val numbered = excerpts.mapIndexed { i, excerpt ->
             "[${i + 1}] $excerpt"
@@ -204,7 +206,7 @@ class SummarizeEngine(
             streamCollect(
                 Prompts.ASK,
                 user,
-                maxTokens = if (bigContext) 1200 else 700,
+                maxTokens = if (bigContext) 1000 else 700,
             )
         )
         _progress.value = Progress("done")
@@ -215,8 +217,8 @@ class SummarizeEngine(
     }
 
     private fun selectRelevantExcerpts(question: String, sourceText: String): List<String> {
-        val excerptSize = if (bigContext) 1800 else 1000
-        val maxExcerpts = if (bigContext) 30 else 6
+        val excerptSize = if (bigContext) 1400 else 1000
+        val maxExcerpts = if (bigContext) 8 else 6
         val all = chunkText(sourceText, excerptSize)
         if (all.isEmpty()) return listOf(sourceText.take(excerptSize))
         if (all.size <= maxExcerpts) return all
@@ -279,25 +281,31 @@ class SummarizeEngine(
     // ── stages ──────────────────────────────────────────────────────────────────
     /** pipeline._final_combine, simplified: one-shot, else hierarchical batches. */
     private suspend fun finalCombine(joined: String): String {
-        // 1) one-shot
-        runCatching {
-            return streamCollect(Prompts.REDUCE, "Section notes, in order:\n\n$joined")
+        // A one-shot combine is only safe when the notes themselves fit the
+        // per-request free-tier token budget.
+        if (joined.length <= singlePassLimit) {
+            runCatching {
+                return streamCollect(Prompts.REDUCE, "Section notes, in order:\n\n$joined")
+            }
         }
-        // 2) hierarchical: batch the note-blocks, condense each, then combine
+
+        // Hierarchical: batch the note-blocks, condense each, then combine.
         val blocks = joined.split("\n\n").filter { it.isNotBlank() }
         val partials = ArrayList<String>()
         var i = 0
         while (i < blocks.size) {
             val batch = blocks.subList(i, minOf(i + 5, blocks.size)).joinToString("\n\n")
-            partials.add(runCatching { streamCollect(Prompts.CHUNK, batch) }
-                .getOrDefault(batch.take(1500)))
+            partials.add(
+                runCatching { streamCollect(Prompts.CHUNK, batch) }
+                    .getOrDefault(batch.take(1500))
+            )
             i += 5
         }
         val small = partials.joinToString("\n\n").take(singlePassLimit)
         runCatching {
             return streamCollect(Prompts.REDUCE, "Section notes, in order:\n\n$small")
         }
-        // 3) pure-local fallback: never throw away a finished run
+        // Pure-local fallback: never throw away a finished run.
         return "**Combined from section notes.**\n\n$small"
     }
 
@@ -307,11 +315,10 @@ class SummarizeEngine(
         existingParts: List<String> = emptyList(),
         onParts: suspend (List<String>) -> Unit = {},
     ): String {
-        // Detailed wants real length. Give the cloud engine a large output budget
-        // (~2 full pages); on-device stays modest so it doesn't run for ages.
-        val onePassCap = if (bigContext) 4000 else 1600
-        val chunkCap = if (bigContext) 3000 else 1200
-        if (src.length <= singlePassLimit * 2) {
+        val onePassCap = if (bigContext) 2200 else 1600
+        val chunkCap = if (bigContext) 1600 else 1200
+        val onePassSourceLimit = if (bigContext) singlePassLimit else singlePassLimit * 2
+        if (src.length <= onePassSourceLimit) {
             return streamCollect(Prompts.DETAILED, source(src), maxTokens = onePassCap)
         }
         val chunks = chunkTextCapped(src)
@@ -340,8 +347,8 @@ class SummarizeEngine(
     // Bounded chunking: pick a chunk size so the total number of chunks stays
     // under maxChunks, growing chunk size as needed up to maxChunkChars. If the
     // source is so large that even maxChunks * maxChunkChars can't hold it, we
-    // process only that leading portion so a single job stays time-bounded on
-    // CPU. This is what prevents the "condensing section 0 of 972" runaway.
+    // process only that leading portion so a single job stays within its daily
+    // work budget.
     private fun chunkTextCapped(text: String): List<String> {
         val cap = maxChunks * maxChunkChars
         val material = if (text.length > cap) text.substring(0, cap) else text
@@ -359,12 +366,16 @@ class SummarizeEngine(
         var cur = StringBuilder()
         for (line in text.split("\n")) {
             if (line.length > size) {
-                if (cur.isNotEmpty()) { chunks.add(cur.toString()); cur = StringBuilder() }
+                if (cur.isNotEmpty()) {
+                    chunks.add(cur.toString())
+                    cur = StringBuilder()
+                }
                 chunks.addAll(hardSplit(line, size))
                 continue
             }
             if (cur.length + line.length + 1 > size && cur.isNotEmpty()) {
-                chunks.add(cur.toString()); cur = StringBuilder(line)
+                chunks.add(cur.toString())
+                cur = StringBuilder(line)
             } else {
                 if (cur.isEmpty()) cur.append(line) else cur.append("\n").append(line)
             }
@@ -378,8 +389,11 @@ class SummarizeEngine(
         val out = ArrayList<String>()
         while (s.length > size) {
             val window = s.substring(0, size)
-            var cut = maxOf(window.lastIndexOf(". "), window.lastIndexOf("? "),
-                            window.lastIndexOf("! "))
+            var cut = maxOf(
+                window.lastIndexOf(". "),
+                window.lastIndexOf("? "),
+                window.lastIndexOf("! "),
+            )
             if (cut < size * 0.5) cut = window.lastIndexOf(' ')
             if (cut <= 0) cut = size
             out.add(s.substring(0, cut + 1).trim())
@@ -388,6 +402,7 @@ class SummarizeEngine(
         if (s.isNotEmpty()) out.add(s)
         return out
     }
+
     companion object {
         private val WORD_REGEX = Regex("[\\p{L}\\p{N}']+")
         private val ASK_STOP_WORDS = setOf(
@@ -395,8 +410,7 @@ class SummarizeEngine(
             "where", "which", "who", "why", "how", "does", "did", "was", "were",
             "are", "is", "can", "could", "would", "should", "about", "into", "than",
             "then", "they", "them", "their", "there", "have", "has", "had", "you",
-            "your", "its", "but", "not", "all", "any", "some", "more", "most"
+            "your", "its", "but", "not", "all", "any", "some", "more", "most",
         )
     }
-
 }
