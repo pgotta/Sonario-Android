@@ -1,7 +1,6 @@
 package ai.sonario.app.ui
 
 import android.app.Application
-import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.compose.runtime.getValue
@@ -14,26 +13,25 @@ import ai.sonario.app.llm.CloudEngine
 import ai.sonario.app.llm.InferenceEngine
 import ai.sonario.app.llm.LlmEngine
 import ai.sonario.app.llm.LlmProvider
-import ai.sonario.app.llm.ProviderConfig
+import ai.sonario.app.llm.ModelInfo
 import ai.sonario.app.llm.RateLimiter
 import ai.sonario.app.llm.SecureStorage
-import ai.sonario.app.source.SourceContent
 import ai.sonario.app.source.SourceFetcher
 import ai.sonario.app.summarize.SummarizeEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.onCompletion
-import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.cancellable
 import kotlinx.coroutines.launch
 import java.io.File
 
 /**
- * Drives the summary screen. Owns three responsibilities:
- *   1. Fetching source material (URL/file/text) via [SourceFetcher].
- *   2. Summarising it via [SummarizeEngine] using the active [InferenceEngine].
- *   3. Storing / restoring the session via [SessionStore].
+ * Drives the summary screen.
  *
- * The active engine is created lazily from [Settings] so changing the provider
+ *   1. Fetches source material (URL / file / pasted text) via [SourceFetcher].
+ *   2. Summarises it via [SummarizeEngine] using the active [InferenceEngine].
+ *   3. Stores / restores sessions via [SessionStore].
+ *
+ * The active engine is created lazily from [Settings] so changing provider
  * or model takes effect without restarting the app.
  */
 class SummaryViewModel(app: Application) : AndroidViewModel(app) {
@@ -43,22 +41,32 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
     val fetcher = SourceFetcher()
     private val rateLimiter = RateLimiter(app)
 
-    var state by mutableStateOf(SummaryState())
+    // ── UI state ────────────────────────────────────────────────────────────────
+
+    var isRunning by mutableStateOf(false)
+        private set
+    var status by mutableStateOf("Ready")
+        private set
+    var sourceTitle by mutableStateOf("")
+        private set
+    var sourceText by mutableStateOf("")
+        private set
+    var summary by mutableStateOf("")
+        private set
+    var error by mutableStateOf<String?>(null)
         private set
 
-    // Read-only state exposed for UI.
+    // Cloud-provider state shown in the UI.
     var activeProvider by mutableStateOf(settings.cloudProvider)
         private set
-    var providerConfig by mutableStateOf(settings.configFor(settings.cloudProvider))
+    var providerModel by mutableStateOf(settings.modelFor(settings.cloudProvider))
         private set
+    val isOnDevice: Boolean get() = settings.engine == EngineChoice.ON_DEVICE
+    val isCloud: Boolean get() = settings.engine == EngineChoice.CLOUD
 
     private var activeEngine: InferenceEngine? = null
     private var summariseJob: Job? = null
     private var loadedSessionId: String? = null
-
-    // Publicly-readable copies of the state machine values
-    val isOnDevice: Boolean get() = settings.engine == EngineChoice.ON_DEVICE
-    val isCloud: Boolean get() = settings.engine == EngineChoice.CLOUD
 
     /** The currently active engine, rebuilt lazily. */
     fun currentEngine(): InferenceEngine {
@@ -70,19 +78,17 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun buildEngine(): InferenceEngine {
-        return when (settings.engine) {
-            EngineChoice.ON_DEVICE -> LlmEngine()
-            EngineChoice.CLOUD -> {
-                activeProvider = settings.cloudProvider
-                providerConfig = settings.configFor(activeProvider)
-                val key = settings.keyFor(activeProvider)
-                CloudEngine(
-                    config = providerConfig,
-                    apiKey = key,
-                    rateLimiter = rateLimiter,
-                )
-            }
+    private fun buildEngine(): InferenceEngine = when (settings.engine) {
+        EngineChoice.ON_DEVICE -> LlmEngine.get(getApplication())
+        EngineChoice.CLOUD -> {
+            activeProvider = settings.cloudProvider
+            providerModel = settings.modelFor(activeProvider)
+            CloudEngine(
+                context = getApplication(),
+                configProvider = { settings.configFor(activeProvider) },
+                apiKeyProvider = { settings.keyFor(activeProvider) },
+                rateLimiter = rateLimiter,
+            )
         }
     }
 
@@ -95,11 +101,12 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
 
     fun loadFromUrl(url: String) {
         updateStatus("Fetching source…")
-        state = state.copy(sourceText = "", sourceTitle = "", summary = "", error = null)
+        resetForNewSource()
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val content = fetcher.fromUrl(url)
-                state = state.copy(sourceText = content.text, sourceTitle = content.title)
+                sourceText = content.text
+                sourceTitle = content.title
                 summarise()
             } catch (e: Exception) {
                 handleFailure(e)
@@ -109,11 +116,11 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
 
     fun loadFromFile(file: File, mime: String) {
         updateStatus("Reading file…")
-        state = state.copy(sourceText = "", sourceTitle = file.name, summary = "", error = null)
+        resetForNewSource()
+        sourceTitle = file.name
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val text = fetcher.fromFile(file, mime)
-                state = state.copy(sourceText = text)
+                sourceText = fetcher.fromFile(file, mime)
                 summarise()
             } catch (e: Exception) {
                 handleFailure(e)
@@ -122,62 +129,94 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun loadFromText(text: String) {
-        state = state.copy(sourceText = text, sourceTitle = "Pasted text", summary = "", error = null)
+        sourceText = text
+        sourceTitle = "Pasted text"
+        error = null
         summarise()
+    }
+
+    private fun resetForNewSource() {
+        sourceText = ""
+        sourceTitle = ""
+        summary = ""
+        error = null
     }
 
     // ── summarisation ───────────────────────────────────────────────────────────
 
     fun summarise() {
-        val text = state.sourceText
+        val text = sourceText
         if (text.isBlank()) return
 
-        // Cancel any in-flight run
         summariseJob?.cancel()
 
         if (settings.engine == EngineChoice.CLOUD) {
             val est = rateLimiter.estimate(text)
             if (est.exceedsDaily) {
-                state = state.copy(
-                    error = "Daily token limit reached (${est.dailyUsed}/${est.dailyLimit}). " +
-                        "Try on-device mode or wait until tomorrow.",
-                    isRunning = false,
-                )
+                error = "Daily token limit reached. Try on-device mode or wait until tomorrow."
+                isRunning = false
                 return
             }
         }
 
         updateStatus("Starting summary…")
-        state = state.copy(isRunning = true, summary = "", error = null)
+        isRunning = true
+        summary = ""
+        error = null
+
+        val engine = currentEngine()
+        val summariser = SummarizeEngine(engine, bigContext = settings.engine == EngineChoice.CLOUD)
+
+        // Collect progress updates (cancellable so cancel() stops them).
+        val progressJob = viewModelScope.launch(Dispatchers.Main) {
+            summariser.progress.cancellable().collect { p ->
+                status = p.phase.replaceFirstChar { it.uppercase() }
+                // Surface partial streaming text when present.
+                if (p.live.isNotBlank()) summary = p.live
+            }
+        }
 
         summariseJob = viewModelScope.launch(Dispatchers.IO) {
             try {
-                val engine = currentEngine()
-                val summariser = SummarizeEngine(engine)
-                summariser.summarise(text)
-                    .onEach { event -> applyEvent(event) }
-                    .onCompletion { e -> if (e != null) handleFailure(e) }
-                    .collect()
-
-                // Persist to session store once we have a full summary
-                if (state.summary.isNotBlank()) {
-                    store.save(
-                        SessionStore.Entry(
-                            id = loadedSessionId ?: "s_${System.currentTimeMillis()}",
-                            title = state.sourceTitle,
-                            sourceText = text,
-                            summary = state.summary,
-                            timestamp = System.currentTimeMillis(),
-                        )
+                val model = if (settings.engine == EngineChoice.CLOUD) {
+                    ModelInfo(
+                        label = providerModel,
+                        fileName = "",
+                        sizeMb = 0,
+                        contextTokens = 131072,
+                        note = "",
+                        downloadUrl = "",
                     )
-                    loadedSessionId = store.latest()?.id
+                } else {
+                    // On-device: pick the first present model as a stub ensureReady arg.
+                    LlmEngine.get(getApplication()).availableModels().firstOrNull { it.present }
+                        ?: ModelInfo("", "", 0, 4096, "", "")
                 }
+                val result = summariser.run(
+                    model = model,
+                    text = text,
+                    title = sourceTitle,
+                    kind = "article",
+                    approxMinutes = null,
+                )
+                summary = result.normal
+                loadedSessionId = store.save(
+                    SessionStore.Entry(
+                        id = loadedSessionId ?: "s_${System.currentTimeMillis()}",
+                        title = sourceTitle,
+                        sourceText = text,
+                        summary = result.normal,
+                        timestamp = System.currentTimeMillis(),
+                    )
+                )
             } catch (e: Exception) {
                 handleFailure(e)
             } finally {
-                if (state.isRunning) {
-                    state = state.copy(isRunning = false)
-                }
+                progressJob.cancel()
+                isRunning = false
+                if (status.startsWith("synthesiz", ignoreCase = true) ||
+                    status.startsWith("condens", ignoreCase = true)
+                ) status = "Done"
             }
         }
     }
@@ -185,28 +224,16 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
     fun cancel() {
         summariseJob?.cancel()
         summariseJob = null
-        state = state.copy(isRunning = false, status = "Cancelled")
+        isRunning = false
+        status = "Cancelled"
     }
 
     fun retry() {
-        state = state.copy(error = null)
+        error = null
         summarise()
     }
 
-    fun clearError() { state = state.copy(error = null) }
-
-    private fun applyEvent(event: SummarizeEngine.Event) {
-        when (event) {
-            is SummarizeEngine.Event.Progress -> updateStatus(event.message)
-            is SummarizeEngine.Event.Done -> {
-                state = state.copy(
-                    summary = event.summary,
-                    isRunning = false,
-                    status = "Done",
-                )
-            }
-        }
-    }
+    fun clearError() { error = null }
 
     private fun handleFailure(e: Throwable) {
         val msg = when (e) {
@@ -222,11 +249,12 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
                 "Authentication failed. Check your ${activeProvider.displayName} API key."
             else -> e.message ?: "Unknown error: ${e.javaClass.simpleName}"
         }
-        state = state.copy(error = msg, isRunning = false)
+        error = msg
+        isRunning = false
     }
 
     private fun updateStatus(msg: String) {
-        state = state.copy(status = msg)
+        status = msg
     }
 
     // ── provider switching ────────────────────────────────────────────────────
@@ -234,7 +262,7 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
     fun switchProvider(provider: LlmProvider) {
         settings.cloudProvider = provider
         activeProvider = provider
-        providerConfig = settings.configFor(provider)
+        providerModel = settings.modelFor(provider)
         rebuildEngine()
     }
 
@@ -243,8 +271,7 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
         rebuildEngine()
     }
 
-    fun hasKeyFor(provider: LlmProvider): Boolean =
-        settings.hasKeyFor(provider)
+    fun hasKeyFor(provider: LlmProvider): Boolean = settings.hasKeyFor(provider)
 
     /** Masked form of the current key for display. */
     fun maskedKeyFor(provider: LlmProvider): String =
@@ -255,29 +282,12 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
     fun loadSession(id: String) {
         val entry = store.byId(id) ?: return
         loadedSessionId = entry.id
-        state = state.copy(
-            sourceText = entry.sourceText,
-            sourceTitle = entry.title,
-            summary = entry.summary,
-            isRunning = false,
-            error = null,
-        )
+        sourceText = entry.sourceText
+        sourceTitle = entry.title
+        summary = entry.summary
+        isRunning = false
+        error = null
     }
 
     fun sessions(): List<SessionStore.Entry> = store.recent()
-
-    // ── state data class ────────────────────────────────────────────────────────
-
-    data class SummaryState(
-        val isRunning: Boolean = false,
-        val status: String = "Ready",
-        val sourceTitle: String = "",
-        val sourceText: String = "",
-        val summary: String = "",
-        val error: String? = null,
-    )
 }
-
-/** Custom exception types the UI can match on for friendly messages. */
-class RateLimitException(message: String) : Exception(message)
-class AuthenticationException(message: String) : Exception(message)
