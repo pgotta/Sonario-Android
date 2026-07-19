@@ -3,9 +3,6 @@ name: Build & Release
 on:
   push:
     branches: [ main, 'upgrade/**' ]
-    tags: [ 'v*' ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -17,36 +14,26 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
           java-version: '17'
+          distribution: 'temurin'
           cache: 'gradle'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
+        uses: android-actions/setup-android@v3
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: ./gradlew assembleDebug --no-daemon
 
-      - name: Upload debug APK artifact
-        uses: actions/upload-artifact@v6
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
         with:
           name: focal-debug-apk
           path: app/build/outputs/apk/debug/*.apk
@@ -54,40 +41,31 @@ jobs:
 
   release:
     needs: build
-    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/upgrade/'))
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v6
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
         with:
           name: focal-debug-apk
           path: ./artifacts
 
-      - name: Determine release tag
-        id: tag
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-            echo "prerelease=false" >> $GITHUB_OUTPUT
-            echo "name=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=latest" >> $GITHUB_OUTPUT
-            echo "prerelease=true" >> $GITHUB_OUTPUT
-            echo "name=Latest Build (${GITHUB_REF_NAME})" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create / Update Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.name }}
+          tag_name: v1.4.0
+          name: Focal v1.4.0
           body: |
-            ## Focal for Android
+            ## Focal for Android v1.4.0
 
             Multi-provider BYOK AI summariser. Paste any YouTube link, article URL, or text and get a summary powered by the LLM provider you choose.
 
-            ### Downloads
+            ### What's new in v1.4.0
+            - **Multi-provider**: Groq, OpenAI, Anthropic (Claude), Ollama, Custom proxy
+            - **BYOK**: Bring your own API key, stored encrypted in Android Keystore
+            - **Renamed** from Sonario to Focal
+
+            ### Download
             - **focal-debug.apk** — debug build, install directly on your phone
 
             ### Setup
@@ -104,7 +82,6 @@ jobs:
             - Ollama (local, no key needed)
             - Custom (any OpenAI-compatible proxy)
           files: ./artifacts/*.apk
-          prerelease: ${{ steps.tag.outputs.prerelease }}
-          generate_release_notes: false
+          prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
