@@ -8,7 +8,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
-import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -129,9 +128,8 @@ class CloudEngine(
         return performRequest(
             endpoint = endpoint,
             payload = payload,
-            key = key,
             estimatedTotal = estimatedTotal,
-            authHeader = "Bearer $key",
+            authHeader = if (key.isNullOrBlank()) "" else "Bearer $key",
         )
     }
 
@@ -159,9 +157,8 @@ class CloudEngine(
         return performRequest(
             endpoint = endpoint,
             payload = payload,
-            key = key,
             estimatedTotal = estimatedTotal,
-            authHeader = "$key",
+            authHeader = if (key.isNullOrBlank()) "" else "$key",
             anthropic = true,
         )
     }
@@ -171,7 +168,6 @@ class CloudEngine(
     private suspend fun performRequest(
         endpoint: String,
         payload: String,
-        key: String?,
         estimatedTotal: Long,
         authHeader: String,
         anthropic: Boolean = false,
@@ -188,11 +184,11 @@ class CloudEngine(
                 .header("Content-Type", "application/json")
                 .post(payload.toRequestBody(media))
             if (anthropic) {
-                builder.header("x-api-key", authHeader)
+                if (authHeader.isNotBlank()) builder.header("x-api-key", authHeader)
                 builder.header("anthropic-version", ANTHROPIC_VERSION)
                 builder.header("anthropic-dangerous-direct-browser-access", "true")
             } else {
-                builder.header("Authorization", authHeader)
+                if (authHeader.isNotBlank()) builder.header("Authorization", authHeader)
             }
             val request = builder.build()
 
@@ -230,7 +226,7 @@ class CloudEngine(
             if (code == 429) {
                 rateAttempt++
                 if (rateAttempt > MAX_RATE_RETRIES) {
-                    throw RuntimeException(friendlyError(code, body, anthropic))
+                    throw RateLimitException(friendlyError(code, body, anthropic))
                 }
                 val seconds = retrySeconds(retryAfterHeader, resetHeader, body)
                 var left = seconds.coerceIn(1L, MAX_RATE_WAIT_SECONDS)
@@ -244,7 +240,11 @@ class CloudEngine(
             }
 
             if (code !in 200..299) {
-                throw RuntimeException(friendlyError(code, body, anthropic))
+                val message = friendlyError(code, body, anthropic)
+                when (code) {
+                    401, 403 -> throw AuthenticationException(message)
+                    else -> throw RuntimeException(message)
+                }
             }
 
             val parsed = if (anthropic) parseAnthropic(body) else parseOpenAI(body)
@@ -397,14 +397,14 @@ class CloudEngine(
                 val remainingMinutes =
                     ((deadline - System.currentTimeMillis()).coerceAtLeast(0) / 60_000L) + 1
                 onNetworkStatus(
-                    "Internet connection lost. Sonario is waiting and will keep retrying " +
+                    "Internet connection lost. Focal is waiting and will keep retrying " +
                         "for about $remainingMinutes more minute${if (remainingMinutes == 1L) "" else "s"}."
                 )
                 delay(NETWORK_POLL_MS)
             }
             if (!hasValidatedInternet()) {
                 throw RuntimeException(
-                    "The phone stayed offline too long, so Sonario could not reach " +
+                    "The phone stayed offline too long, so Focal could not reach " +
                         "${configProvider().provider.displayName}.", error
                 )
             }
@@ -442,7 +442,7 @@ class CloudEngine(
 
     private fun friendlyNetworkError(error: IOException): String = when (error) {
         is UnknownHostException ->
-            "Sonario could not resolve the API server. It kept retrying, but the phone's " +
+            "Focal could not resolve the API server. It kept retrying, but the phone's " +
                 "internet or DNS connection did not recover. Check Wi-Fi/mobile data and try again."
         is SocketTimeoutException ->
             "The connection timed out after automatic retries. Check the connection and try again."
