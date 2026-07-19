@@ -12,19 +12,23 @@ import kotlinx.coroutines.flow.Flow
  * provider requires no changes outside the llm package.
  */
 interface InferenceEngine {
-    /**
-     * Generate a single completion for [prompt]. The returned [Flow] emits
-     * incremental text chunks as they arrive from the provider (true streaming
-     * for cloud, simulated chunking for on-device). The flow completes when
-     * the full response has been emitted.
-     */
-    fun complete(prompt: String): Flow<String>
 
     /**
-     * Free native / network resources. Called when the engine is rebuilt
-     * (provider change) or the ViewModel is cleared.
+     * Verify the engine is ready. For on-device this loads the GGUF file;
+     * for cloud this validates that an API key is present (if needed).
+     * Throws [IllegalStateException] with a user-friendly message if not ready.
      */
-    fun close() {}
+    suspend fun ensureReady(model: ModelInfo)
+
+    /**
+     * Generate a single completion given a [system] steering prompt and a
+     * [user] payload prompt, capped at [maxTokens] output tokens.
+     *
+     * The returned [Flow] emits incremental text chunks as they arrive
+     * (true streaming for cloud, simulated chunking for on-device). The
+     * flow completes when the full response has been emitted.
+     */
+    fun stream(system: String, user: String, maxTokens: Int): Flow<String>
 }
 
 /**
