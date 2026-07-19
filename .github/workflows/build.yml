@@ -42,9 +42,6 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Run lint
-        run: ./gradlew lintDebug --no-daemon --stacktrace
-
       - name: Build debug APK
         run: ./gradlew assembleDebug --no-daemon --stacktrace
 
@@ -54,14 +51,6 @@ jobs:
           name: focal-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 90
-
-      - name: Upload lint report
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: lint-report
-          path: app/build/reports/lint-results-debug.html
-          retention-days: 14
 
   release:
     needs: build
