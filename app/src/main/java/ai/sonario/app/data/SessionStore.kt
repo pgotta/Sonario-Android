@@ -1,6 +1,7 @@
 package ai.sonario.app.data
 
 import android.content.Context
+import ai.sonario.app.llm.LlmProvider
 import ai.sonario.app.source.FileTextExtractor
 import ai.sonario.app.summarize.SummarizeEngine
 import org.json.JSONArray
@@ -24,9 +25,10 @@ data class SummarySession(
     val approxMinutes: Int? = null,
     val sourceText: String = "",
     val chapters: List<FileTextExtractor.Chapter> = emptyList(),
-    val engineChoice: EngineChoice = EngineChoice.GROQ,
+    val engineChoice: EngineChoice = EngineChoice.CLOUD,
     val modelFileName: String = "",
-    val groqModel: String = Settings.DEFAULT_GROQ_MODEL,
+    val cloudProviderId: String = LlmProvider.GROQ.id,
+    val cloudModel: String = "",
     val phase: String = "fetching",
     val progressCurrent: Int = 0,
     val progressTotal: Int = 0,
@@ -141,13 +143,6 @@ class SessionStore(context: Context) {
         sessionDir(id).deleteRecursively()
     }
 
-    /**
-     * Permanently removes every saved session and its private source data.
-     *
-     * Each session directory contains the saved transcript/source text,
-     * chapter data, summary/checkpoint metadata, and question history, so
-     * deleting the directory tree removes the complete local session record.
-     */
     @Synchronized
     fun clearAll() {
         root.listFiles()?.forEach { child -> child.deleteRecursively() }
@@ -182,7 +177,8 @@ class SessionStore(context: Context) {
         .put("approxMinutes", s.approxMinutes ?: JSONObject.NULL)
         .put("engineChoice", s.engineChoice.name)
         .put("modelFileName", s.modelFileName)
-        .put("groqModel", s.groqModel)
+        .put("cloudProviderId", s.cloudProviderId)
+        .put("cloudModel", s.cloudModel)
         .put("phase", s.phase)
         .put("progressCurrent", s.progressCurrent)
         .put("progressTotal", s.progressTotal)
@@ -221,9 +217,10 @@ class SessionStore(context: Context) {
             sourceText = sourceText,
             chapters = chapters,
             engineChoice = runCatching { EngineChoice.valueOf(o.optString("engineChoice")) }
-                .getOrDefault(EngineChoice.GROQ),
-            modelFileName = o.optString("modelFileName"),
-            groqModel = o.optString("groqModel", Settings.DEFAULT_GROQ_MODEL),
+                .getOrDefault(EngineChoice.CLOUD),
+            modelFileName = o.optString("modelFileName", ""),
+            cloudProviderId = o.optString("cloudProviderId", LlmProvider.GROQ.id),
+            cloudModel = o.optString("cloudModel", ""),
             phase = o.optString("phase", ""),
             progressCurrent = o.optInt("progressCurrent"),
             progressTotal = o.optInt("progressTotal"),
@@ -297,7 +294,7 @@ class SessionStore(context: Context) {
     private fun sessionDir(id: String) = File(root, id)
 
     companion object {
-        private const val SCHEMA = 1
+        private const val SCHEMA = 2
         private const val MAX_SESSIONS = 12
         private const val META_FILE = "session.json"
         private const val SOURCE_FILE = "source.txt"
