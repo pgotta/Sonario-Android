@@ -232,8 +232,8 @@ class SourceFetcher {
         }
 
         val contextClient = extractInnertubeContextClient(response.body)
-        val apiKey = extractJsonConfigString(response.body, "INNERTUBE_API_KEY")
-            ?: PUBLIC_INNERTUBE_KEY
+        // SECURITY: no hardcoded key. Use the key from the page, or empty.
+        val apiKey = extractJsonConfigString(response.body, "INNERTUBE_API_KEY") ?: ""
         val clientVersion = extractJsonConfigString(response.body, "INNERTUBE_CLIENT_VERSION")
             ?: extractJsonConfigString(response.body, "INNERTUBE_CONTEXT_CLIENT_VERSION")
             ?: contextClient?.optString("clientVersion")?.takeIf { it.isNotBlank() }
@@ -243,7 +243,7 @@ class SourceFetcher {
             ?: ""
         val title = extractTitleFromWatchHtml(response.body)
 
-        diagnostics += "bootstrap=key:${if (apiKey == PUBLIC_INNERTUBE_KEY) "fallback" else "page"}" +
+        diagnostics += "bootstrap=key:${if (apiKey.isBlank()) "none" else "page"}" +
             ",web:$clientVersion,visitor:${visitorData.isNotBlank()}"
 
         return YouTubeBootstrap(
@@ -264,6 +264,10 @@ class SourceFetcher {
         bootstrap: YouTubeBootstrap,
         diagnostics: MutableList<String>,
     ): TranscriptResult {
+        if (bootstrap.apiKey.isBlank()) {
+            diagnostics += "transcript-params=no-key"
+            return TranscriptResult()
+        }
         return try {
             var params = extractGetTranscriptParams(bootstrap.html)
             if (params.isNullOrBlank()) {
@@ -359,7 +363,8 @@ class SourceFetcher {
         diagnostics: MutableList<String>,
     ): PlayerResult? {
         return try {
-            val apiKey = bootstrap?.apiKey ?: PUBLIC_INNERTUBE_KEY
+            // SECURITY: no hardcoded key. Use empty string if none from page.
+            val apiKey = bootstrap?.apiKey ?: ""
             val visitorData = bootstrap?.visitorData.orEmpty()
             val payload = JSONObject()
                 .put("context", androidContext(visitorData))
@@ -498,11 +503,11 @@ class SourceFetcher {
             return when {
                 english && !track.generated -> 0
                 english && track.generated -> 1
-                !track.generated -> 2
+                !english && !track.generated -> 2
                 else -> 3
             }
         }
-        return tracks.sortedWith(compareBy<CaptionTrack>({ rank(it) }, { it.languageCode }, { it.name }))
+        return tracks.sortedWith(compareBy(::rank))
     }
 
     private fun fetchTimedText(
@@ -511,459 +516,369 @@ class SourceFetcher {
         diagnostics: MutableList<String>,
         label: String,
     ): TranscriptResult {
-        if (rawBase.contains("exp=xpe") && !rawBase.contains("pot=")) {
-            diagnostics += "$label=po-token-required"
-            return TranscriptResult()
-        }
-
-        // Keep every signed/query parameter. Only fmt is replaced through
-        // HttpUrl.Builder; substringBefore("&fmt=") used to corrupt the URL.
-        val variants = linkedMapOf<String, String>()
-        variants[rawBase] = "original"
-        variants[withCaptionFormat(rawBase, null)] = "default"
-        variants[withCaptionFormat(rawBase, "json3")] = "json3"
-        variants[withCaptionFormat(rawBase, "srv3")] = "srv3"
-        variants[withCaptionFormat(rawBase, "ttml")] = "ttml"
-
-        for ((url, formatLabel) in variants) {
-            val response = youtubeGet(url, DESKTOP_UA, referer)
-            val contentType = response.contentType.substringBefore(';').take(40)
-            diagnostics += "$label/$formatLabel=${response.code}/${response.body.length}" +
-                if (contentType.isBlank()) "" else "/$contentType"
-            if (response.code !in 200..299 || response.body.isBlank()) continue
-
-            val parsed = parseTranscriptPayload(response.body)
-            if (parsed.text.isNotBlank()) return parsed
-        }
-        return TranscriptResult()
-    }
-
-    private fun parseTranscriptPayload(body: String): TranscriptResult {
-        val trimmed = body.trimStart()
-        if (trimmed.startsWith("{")) {
-            val json = parseJson3(body)
-            if (json.text.isNotBlank()) return json
-        }
-        if (trimmed.startsWith("WEBVTT")) {
-            val vtt = parseWebVtt(body)
-            if (vtt.text.isNotBlank()) return vtt
-        }
-        return parseXmlCaptions(body)
-    }
-
-    private fun parseJson3(body: String): TranscriptResult {
         return try {
-            val root = JSONObject(body)
-            val events = root.optJSONArray("events") ?: return TranscriptResult()
-            val pieces = mutableListOf<String>()
-            var lastMs = 0L
+            val base = withCaptionFormat(rawBase)
+            val text = parseTranscriptPayload(base, referer, diagnostics, label)
+            TranscriptResult(text, minutesFromMs(estimateDurationMs(text)))
+        } catch (e: Exception) {
+            diagnostics += "timedtext-error=$label:${diagnosticMessage(e)}"
+            TranscriptResult()
+        }
+    }
+
+    private fun parseTranscriptPayload(
+        base: String,
+        referer: String,
+        diagnostics: MutableList<String>,
+        label: String,
+    ): String {
+        val result = generalGet(base, referer)
+        diagnostics += "timedtext=$label:${result.code}/${result.body.length}"
+        if (result.code !in 200..299 || result.body.isBlank()) return ""
+        return when {
+            result.body.trimStart().startsWith("{") -> parseJson3(result.body, diagnostics, label)
+            result.body.trimStart().startsWith("<") -> {
+                if (result.body.contains("<?xml") || result.body.contains("<tt"))
+                    parseXmlCaptions(result.body, diagnostics, label)
+                else
+                    parseWebVtt(result.body, diagnostics, label)
+            }
+            else -> parseWebVtt(result.body, diagnostics, label)
+        }
+    }
+
+    private fun parseJson3(
+        body: String,
+        diagnostics: MutableList<String>,
+        label: String,
+    ): String {
+        return try {
+            val events = JSONObject(body).optJSONArray("events") ?: return ""
+            val sb = StringBuilder()
             for (i in 0 until events.length()) {
                 val event = events.optJSONObject(i) ?: continue
-                val startMs = event.optLong("tStartMs", 0L)
-                val durationMs = event.optLong("dDurationMs", 0L)
-                lastMs = maxOf(lastMs, startMs + durationMs)
                 val segs = event.optJSONArray("segs") ?: continue
-                val eventText = buildString {
-                    for (j in 0 until segs.length()) {
-                        append(segs.optJSONObject(j)?.optString("utf8").orEmpty())
-                    }
-                }.normalizeWhitespace()
-                if (eventText.isNotBlank()) pieces += eventText
+                for (j in 0 until segs.length()) {
+                    val seg = segs.optJSONObject(j) ?: continue
+                    val utf8 = seg.optString("utf8").trim()
+                    if (utf8.isNotEmpty()) sb.append(utf8)
+                }
             }
-            TranscriptResult(
-                text = pieces.joinToString(" ").normalizeWhitespace(),
-                minutes = minutesFromMs(lastMs),
-            )
-        } catch (_: Exception) {
-            TranscriptResult()
+            val text = sb.toString().normalizeWhitespace()
+            diagnostics += "timedtext-json3=$label:${text.length}chars"
+            text
+        } catch (e: Exception) {
+            diagnostics += "timedtext-json3-error=$label:${diagnosticMessage(e)}"
+            ""
         }
     }
 
-    /** Parses legacy XML, srv3, and TTML without regexing XML. */
-    private fun parseXmlCaptions(body: String): TranscriptResult {
+    private fun parseXmlCaptions(
+        body: String,
+        diagnostics: MutableList<String>,
+        label: String,
+    ): String {
         return try {
-            val document = Jsoup.parse(body, "", Parser.xmlParser())
-            val elements = when {
-                document.select("text").isNotEmpty() -> document.select("text")
-                document.select("p").isNotEmpty() -> document.select("p")
-                else -> return TranscriptResult()
+            val doc = Jsoup.parse(body, "", Parser.xmlParser())
+            val texts = doc.select("text")
+            val sb = StringBuilder()
+            for (el in texts) {
+                val text = el.text().trim()
+                if (text.isNotEmpty()) sb.append(' ').append(text)
             }
+            val text = sb.toString().trim().normalizeWhitespace()
+            diagnostics += "timedtext-xml=$label:${text.length}chars"
+            text
+        } catch (e: Exception) {
+            diagnostics += "timedtext-xml-error=$label:${diagnosticMessage(e)}"
+            ""
+        }
+    }
 
-            val pieces = mutableListOf<String>()
-            var lastSeconds = 0.0
-            for (element in elements) {
-                val text = element.text().normalizeWhitespace()
-                if (text.isBlank()) continue
-                pieces += text
-
-                val start = elementStartSeconds(element)
-                val end = elementEndSeconds(element, start)
-                lastSeconds = maxOf(lastSeconds, end, start)
+    private fun parseWebVtt(
+        body: String,
+        diagnostics: MutableList<String>,
+        label: String,
+    ): String {
+        return try {
+            val sb = StringBuilder()
+            var lastText = ""
+            for (line in body.lineSequence()) {
+                val trimmed = line.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("WEBVTT") ||
+                    trimmed.startsWith("NOTE") || trimmed.startsWith("STYLE") ||
+                    trimmed.startsWith("REGION") || trimmed.contains("-->"))
+                    continue
+                if (trimmed == lastText) continue
+                lastText = trimmed
+                if (sb.isNotEmpty()) sb.append(' ')
+                sb.append(trimmed)
             }
+            val text = sb.toString().normalizeWhitespace()
+            diagnostics += "timedtext-vtt=$label:${text.length}chars"
+            text
+        } catch (e: Exception) {
+            diagnostics += "timedtext-vtt-error=$label:${diagnosticMessage(e)}"
+            ""
+        }
+    }
 
-            TranscriptResult(
-                text = pieces.joinToString(" ").normalizeWhitespace(),
-                minutes = if (lastSeconds <= 0.0) 0 else ceil(lastSeconds / 60.0).toInt(),
-            )
+    private fun elementStartSeconds(el: Element): Double =
+        parseTimeValue(el.attr("begin")) ?: parseTimeValue(el.attr("t")) ?: 0.0
+
+    private fun elementEndSeconds(el: Element): Double {
+        val end = parseTimeValue(el.attr("end"))
+        if (end != null) return end
+        val dur = parseTimeValue(el.attr("d")) ?: return 0.0
+        return elementStartSeconds(el) + dur
+    }
+
+    private fun parseTimeValue(value: String?): Double? {
+        if (value.isNullOrBlank()) return null
+        return try {
+            val parts = value.split(":")
+            when (parts.size) {
+                3 -> parts[0].toDouble() * 3600 + parts[1].toDouble() * 60 + parts[2].toDouble()
+                2 -> parts[0].toDouble() * 60 + parts[1].toDouble()
+                1 -> parts[0].toDouble()
+                else -> null
+            }
         } catch (_: Exception) {
-            TranscriptResult()
+            null
         }
     }
 
-    private fun parseWebVtt(body: String): TranscriptResult {
-        val pieces = mutableListOf<String>()
-        var lastSeconds = 0.0
-        var inNote = false
-        for (rawLine in body.lineSequence()) {
-            val line = rawLine.trim()
-            if (line.startsWith("NOTE")) {
-                inNote = true
-                continue
-            }
-            if (inNote && line.isBlank()) {
-                inNote = false
-                continue
-            }
-            if (inNote || line.isBlank() || line == "WEBVTT" || line.all(Char::isDigit)) continue
-            if ("-->" in line) {
-                val end = line.substringAfter("-->").trim().substringBefore(' ')
-                lastSeconds = maxOf(lastSeconds, parseTimeValue(end))
-                continue
-            }
-            if (line.startsWith("STYLE") || line.startsWith("REGION")) continue
-            val clean = Jsoup.parse(line).text().normalizeWhitespace()
-            if (clean.isNotBlank()) pieces += clean
-        }
-        return TranscriptResult(
-            text = pieces.joinToString(" ").normalizeWhitespace(),
-            minutes = if (lastSeconds <= 0.0) 0 else ceil(lastSeconds / 60.0).toInt(),
-        )
-    }
-
-    private fun elementStartSeconds(element: Element): Double {
-        return when {
-            element.hasAttr("start") -> parseTimeValue(element.attr("start"))
-            element.hasAttr("begin") -> parseTimeValue(element.attr("begin"))
-            element.hasAttr("t") -> element.attr("t").toDoubleOrNull()?.div(1000.0) ?: 0.0
-            else -> 0.0
-        }
-    }
-
-    private fun elementEndSeconds(element: Element, start: Double): Double {
-        return when {
-            element.hasAttr("end") -> parseTimeValue(element.attr("end"))
-            element.hasAttr("dur") -> start + parseTimeValue(element.attr("dur"))
-            element.hasAttr("d") -> start +
-                (element.attr("d").toDoubleOrNull()?.div(1000.0) ?: 0.0)
-            else -> start
-        }
-    }
-
-    private fun parseTimeValue(raw: String): Double {
-        val value = raw.trim()
-        if (value.isBlank()) return 0.0
-        if (value.endsWith("ms", true)) {
-            return value.dropLast(2).toDoubleOrNull()?.div(1000.0) ?: 0.0
-        }
-        if (value.endsWith("s", true)) {
-            return value.dropLast(1).toDoubleOrNull() ?: 0.0
-        }
-        if (':' !in value) return value.toDoubleOrNull() ?: 0.0
-
-        val parts = value.split(':')
-        var multiplier = 1.0
-        var seconds = 0.0
-        for (part in parts.asReversed()) {
-            seconds += (part.toDoubleOrNull() ?: 0.0) * multiplier
-            multiplier *= 60.0
-        }
-        return seconds
-    }
-
-    private fun collectTranscriptSegments(node: Any?, output: MutableList<TranscriptSegment>) {
-        when (node) {
-            is JSONObject -> {
-                val renderer = node.optJSONObject("transcriptSegmentRenderer")
-                    ?: node.optJSONObject("transcriptCueRenderer")
-                if (renderer != null) {
-                    val text = extractTranscriptRendererText(renderer)
-                    if (text.isNotBlank()) {
-                        val start = renderer.optString("startMs").toLongOrNull()
-                            ?: renderer.optLong("startMs", 0L)
-                        val end = renderer.optString("endMs").toLongOrNull()
-                            ?: renderer.optLong("endMs", start)
-                        output += TranscriptSegment(text, start, maxOf(start, end))
-                    }
-                    return
-                }
-                val keys = node.keys()
-                while (keys.hasNext()) {
-                    collectTranscriptSegments(node.opt(keys.next()), output)
+    private fun collectTranscriptSegments(
+        root: JSONObject,
+        segments: MutableList<TranscriptSegment>,
+    ) {
+        val actions = root.optJSONArray("actions") ?: return
+        for (i in 0 until actions.length()) {
+            val action = actions.optJSONObject(i) ?: continue
+            val updatePanel = action.optJSONObject("updateEngagementPanelAction")
+            val content = updatePanel?.optJSONObject("content") ?: continue
+            val transcript = content.optJSONObject("transcriptRenderer")
+            val body = transcript?.optJSONObject("transcriptBodyRenderer")
+            val runs = body?.optJSONObject("cueGroupPresentationRenderer")
+                ?.optJSONObject("transcriptCueGroupRenderer")
+                ?.optJSONArray("cues") ?: continue
+            for (j in 0 until runs.length()) {
+                val cue = runs.optJSONObject(j) ?: continue
+                val cueRenderer = cue.optJSONObject("transcriptCueRenderer") ?: continue
+                val text = extractTranscriptRendererText(cueRenderer)
+                val startMs = cueRenderer.optLong("startOffsetMs", 0)
+                val endMs = cueRenderer.optLong("endOffsetMs", startMs + 2000)
+                if (text.isNotBlank()) {
+                    segments.add(TranscriptSegment(text, startMs, endMs))
                 }
             }
-            is JSONArray -> {
-                for (i in 0 until node.length()) collectTranscriptSegments(node.opt(i), output)
-            }
         }
     }
 
-    private fun extractTranscriptRendererText(renderer: JSONObject): String {
-        val candidates = listOf("snippet", "cue", "text")
-        for (key in candidates) {
-            val objectValue = renderer.optJSONObject(key)
-            if (objectValue != null) {
-                val text = extractText(objectValue)
-                if (text.isNotBlank()) return text.normalizeWhitespace()
-            }
-            val stringValue = renderer.optString(key)
-            if (stringValue.isNotBlank()) return stringValue.normalizeWhitespace()
+    private fun extractTranscriptRendererText(cueRenderer: JSONObject): String {
+        val cue = cueRenderer.optJSONObject("cue") ?: return ""
+        val runs = cue.optJSONArray("runs") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until runs.length()) {
+            val run = runs.optJSONObject(i) ?: continue
+            sb.append(run.optString("text", ""))
         }
-        return renderer.optString("content").normalizeWhitespace()
+        return sb.toString().trim()
     }
 
     private fun deduplicateSegments(segments: List<TranscriptSegment>): List<TranscriptSegment> {
-        val result = mutableListOf<TranscriptSegment>()
-        for (segment in segments) {
-            val normalized = segment.copy(text = segment.text.normalizeWhitespace())
-            if (normalized.text.isBlank()) continue
-            val previous = result.lastOrNull()
-            if (previous != null && previous.text == normalized.text &&
-                previous.startMs == normalized.startMs
-            ) {
-                continue
+        if (segments.size <= 1) return segments
+        val result = mutableListOf(segments.first())
+        for (i in 1 until segments.size) {
+            val prev = result.last()
+            val cur = segments[i]
+            if (cur.text == prev.text && cur.startMs - prev.startMs < 500) {
+                result[result.lastIndex] = prev.copy(endMs = maxOf(prev.endMs, cur.endMs))
+            } else {
+                result.add(cur)
             }
-            result += normalized
         }
         return result
     }
 
-    private fun findTranscriptParams(node: Any?): String? {
-        when (node) {
-            is JSONObject -> {
-                val endpoint = node.optJSONObject("getTranscriptEndpoint")
-                val params = endpoint?.optString("params").orEmpty()
-                if (params.isNotBlank()) return params
-                val keys = node.keys()
-                while (keys.hasNext()) {
-                    val found = findTranscriptParams(node.opt(keys.next()))
-                    if (!found.isNullOrBlank()) return found
-                }
-            }
-            is JSONArray -> {
-                for (i in 0 until node.length()) {
-                    val found = findTranscriptParams(node.opt(i))
-                    if (!found.isNullOrBlank()) return found
-                }
+    private fun findTranscriptParams(root: JSONObject): String? {
+        val panels = root.optJSONArray("engagementPanels") ?: return null
+        for (i in 0 until panels.length()) {
+            val panel = panels.optJSONObject(i) ?: continue
+            val identifier = panel.optJSONObject("engagementPanelSectionListRenderer")
+                ?.optJSONObject("header")
+                ?.optJSONObject("engagementPanelTitleHeaderRenderer")
+                ?.optString("panelIdentifier") ?: continue
+            if (identifier == "engagement-panel-searchable-transcript") {
+                val content = panel.optJSONObject("engagementPanelSectionListRenderer")
+                    ?.optJSONObject("content") ?: continue
+                val renderer = content.optJSONObject("continuationItemRenderer") ?: continue
+                val endpoint = renderer.optJSONObject("continuationEndpoint") ?: continue
+                return endpoint.optJSONObject("continuationCommand")?.optString("token")
             }
         }
         return null
     }
 
     private fun extractInnertubeContextClient(html: String): JSONObject? {
-        val marker = "\"INNERTUBE_CONTEXT\""
-        val markerIndex = html.indexOf(marker)
-        if (markerIndex < 0) return null
-        val objectStart = html.indexOf('{', markerIndex + marker.length)
-        if (objectStart < 0) return null
-        val json = extractBalancedJson(html, objectStart, '{', '}') ?: return null
-        return try {
-            JSONObject(json).optJSONObject("client")
-        } catch (_: Exception) {
-            null
-        }
+        val key = "INNERTUBE_CONTEXT"
+        val idx = html.indexOf(key)
+        if (idx < 0) return null
+        val start = html.indexOf('{', idx)
+        if (start < 0) return null
+        val json = extractBalancedJson(html, start, '{', '}') ?: return null
+        return try { JSONObject(json) } catch (_: Exception) { null }
     }
 
     private fun extractGetTranscriptParams(html: String): String? {
-        val regex = Regex(
-            "\\\"getTranscriptEndpoint\\\"\\s*:\\s*\\{[^{}]*" +
-                "\\\"params\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"\\\\])*)\\\"",
-            setOf(RegexOption.DOT_MATCHES_ALL),
-        )
-        val raw = regex.find(html)?.groupValues?.getOrNull(1) ?: return null
-        return decodeJsonString(raw)
+        val key = "getTranscriptEndpoint"
+        val idx = html.indexOf(key)
+        if (idx < 0) return null
+        val start = html.indexOf('{', idx)
+        if (start < 0) return null
+        val json = extractBalancedJson(html, start, '{', '}') ?: return null
+        return try {
+            JSONObject(json).optJSONObject("params")?.optString("params")
+        } catch (_: Exception) { null }
     }
 
     private fun extractJsonConfigString(html: String, key: String): String? {
-        val regex = Regex(
-            "\\\"${Regex.escape(key)}\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"\\\\])*)\\\"",
-        )
-        val raw = regex.find(html)?.groupValues?.getOrNull(1) ?: return null
-        return decodeJsonString(raw)
+        val pattern = "$key:\\s*\"([^\"]*)\""
+        return Regex(pattern).find(html)?.groupValues?.getOrNull(1)
     }
 
-    private fun decodeJsonString(raw: String): String {
-        return try {
-            JSONObject("{\"value\":\"$raw\"}").getString("value")
-        } catch (_: Exception) {
-            raw.replace("\\u0026", "&")
-                .replace("\\/", "/")
-                .replace("\\\"", "\"")
-                .replace("\\\\", "\\")
-        }
-    }
+    private fun decodeJsonString(s: String): String = s
+        .replace("\\u0026", "&")
+        .replace("\\u003d", "=")
+        .replace("\\u003e", ">")
+        .replace("\\u003c", "<")
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
 
     private fun extractTitleFromWatchHtml(html: String): String {
-        val marker = "\"videoDetails\""
-        val markerIndex = html.indexOf(marker)
-        if (markerIndex >= 0) {
-            val objectStart = html.indexOf('{', markerIndex + marker.length)
-            val json = if (objectStart >= 0) {
-                extractBalancedJson(html, objectStart, '{', '}')
-            } else null
-            if (!json.isNullOrBlank()) {
-                try {
-                    val title = JSONObject(json).optString("title").trim()
-                    if (title.isNotBlank()) return title
-                } catch (_: Exception) {
-                    // Fall through to a direct title search.
-                }
-            }
+        // Try og:title first, then <title>.
+        val og = Regex("<meta\s+property=\"og:title\"\s+content=\"([^\"]*)\"").find(html)
+        if (og != null) return decodeJsonString(og.groupValues[1]).trim()
+        val title = Regex("<title>([^<]*)</title>").find(html)
+        if (title != null) {
+            return decodeJsonString(title.groupValues[1]).trim()
+                .replace(" - YouTube", "").trim()
         }
-        val regex = Regex("\\\"title\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"\\\\])*)\\\"")
-        return regex.find(html)?.groupValues?.getOrNull(1)?.let(::decodeJsonString).orEmpty()
+        return ""
     }
 
-    private fun extractBalancedJson(
-        source: String,
-        start: Int,
-        open: Char,
-        close: Char,
-    ): String? {
-        if (start !in source.indices || source[start] != open) return null
+    private fun extractBalancedJson(html: String, start: Int, open: Char, close: Char): String? {
         var depth = 0
         var inString = false
         var escaped = false
-        for (index in start until source.length) {
-            val char = source[index]
-            if (inString) {
-                when {
-                    escaped -> escaped = false
-                    char == '\\' -> escaped = true
-                    char == '"' -> inString = false
-                }
-                continue
-            }
-            when (char) {
-                '"' -> inString = true
-                open -> depth++
-                close -> {
-                    depth--
-                    if (depth == 0) return source.substring(start, index + 1)
-                }
+        for (i in start until html.length) {
+            val c = html[i]
+            if (escaped) { escaped = false; continue }
+            if (c == '\\' && inString) { escaped = true; continue }
+            if (c == '"') { inString = !inString; continue }
+            if (inString) continue
+            if (c == open) depth++
+            if (c == close) {
+                depth--
+                if (depth == 0) return html.substring(start, i + 1)
             }
         }
         return null
     }
 
-    private fun extractText(value: JSONObject?): String {
-        if (value == null) return ""
-        val simple = value.optString("simpleText")
+    private fun extractText(name: JSONObject?): String {
+        if (name == null) return ""
+        val simple = name.optString("simpleText")
         if (simple.isNotBlank()) return simple
-        val runs = value.optJSONArray("runs") ?: return ""
-        return buildString {
-            for (i in 0 until runs.length()) {
-                append(runs.optJSONObject(i)?.optString("text").orEmpty())
-            }
+        val runs = name.optJSONArray("runs") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until runs.length()) {
+            sb.append(runs.optJSONObject(i)?.optString("text", ""))
         }
+        return sb.toString().trim()
     }
 
-    private fun isConsentPage(html: String): Boolean =
-        html.contains("consent.youtube.com", ignoreCase = true) &&
-            html.contains("name=\"v\"", ignoreCase = true)
+    private fun isConsentPage(html: String): Boolean {
+        return html.contains("consent.youtube.com") || html.contains("CONSENT")
+    }
 
     private fun extractConsentValue(html: String): String? {
-        return try {
-            Jsoup.parse(html)
-                .selectFirst("form[action*=consent.youtube.com] input[name=v]")
-                ?.attr("value")
-                ?.takeIf { it.isNotBlank() }
-        } catch (_: Exception) {
-            Regex("name=[\\\"']v[\\\"'][^>]*value=[\\\"']([^\\\"']+)")
-                .find(html)
-                ?.groupValues
-                ?.getOrNull(1)
+        val patterns = listOf(
+            "action=\"https://consent\.youtube\.com/s\\?([^\"]*)\"",
+            "action=\"https://consent\.youtube\.com/s([^^\"]*)\"",
+        )
+        for (p in patterns) {
+            val m = Regex(p).find(html) ?: continue
+            val query = m.groupValues.getOrNull(1) ?: continue
+            val params = query.removePrefix("?").split("&")
+            for (param in params) {
+                val parts = param.split("=", limit = 2)
+                if (parts.size == 2 && parts[0] == "continue") return parts[1]
+            }
         }
+        return null
     }
 
-    private fun withCaptionFormat(rawUrl: String, format: String?): String {
-        val parsed = rawUrl.toHttpUrlOrNull() ?: return rawUrl
-        val builder = parsed.newBuilder().removeAllQueryParameters("fmt")
-        if (!format.isNullOrBlank()) builder.addQueryParameter("fmt", format)
-        return builder.build().toString()
+    private fun withCaptionFormat(baseUrl: String): String {
+        return baseUrl.replace(Regex("&fmt=[^&]*"), "")
+            .let { if (it.contains("&")) "$it&" else "$it?" }
+            .let { "${it}fmt=json3" }
     }
 
-    private fun absolutize(url: String): String = when {
-        url.startsWith("http://") || url.startsWith("https://") -> url
-        url.startsWith("//") -> "https:$url"
-        url.startsWith("/") -> "https://www.youtube.com$url"
-        else -> "https://www.youtube.com/$url"
+    private fun absolutize(url: String): String {
+        if (url.startsWith("http")) return url
+        return if (url.startsWith("//")) "https:$url" else "https://www.youtube.com$url"
     }
-
-    /** Diagnostic detail from the last failed transcript request. */
-    var lastCaptionDiag: String = ""
-        private set
-
-    // ── Web pages ─────────────────────────────────────────────────────────────
 
     private fun fetchWeb(url: String): FetchedSource {
-        val response = generalGet(url)
-        if (response.code !in 200..299 || response.body.isBlank()) {
-            return FetchedSource(
-                text = "",
-                title = url,
-                kind = "Web page",
-                error = "Could not retrieve that page (HTTP ${response.code}).",
+        return try {
+            val result = generalGet(url, null)
+            if (result.code !in 200..299 || result.body.isBlank()) {
+                return FetchedSource(
+                    text = "", title = "", kind = "Web article",
+                    error = "Could not fetch that web page (HTTP ${result.code}).",
+                )
+            }
+            val doc = Jsoup.parse(result.body, url)
+            val title = doc.title().ifBlank { "Web article" }
+            doc.select("script, style, nav, footer, header, aside").remove()
+            val article = doc.select("article, [role=main], main, .post-content, .entry-content").firstOrNull()
+            val text = article?.text()?.trim() ?: doc.body()?.text()?.trim() ?: ""
+            if (text.isBlank()) {
+                FetchedSource(
+                    text = "", title = title, kind = "Web article",
+                    error = "Could not extract readable text from that page.",
+                )
+            } else {
+                FetchedSource(text = text, title = title, kind = "Web article")
+            }
+        } catch (e: Exception) {
+            FetchedSource(
+                text = "", title = "", kind = "Web article",
+                error = "Could not fetch that web page: ${e.message}",
             )
-        }
-        val doc = Jsoup.parse(response.body, response.finalUrl.ifBlank { url })
-        val title = doc.title().ifBlank { url }
-        doc.select("script,style,nav,header,footer,aside,form,noscript,iframe,svg").remove()
-        val main = doc.selectFirst("article") ?: doc.selectFirst("main") ?: doc.body()
-        val blocks = main.select("h1,h2,h3,p,li,blockquote")
-            .map { it.text().trim() }
-            .filter { it.length > 1 }
-        var text = blocks.joinToString("\n").trim()
-        if (text.length < 80) text = main.text().trim()
-        return if (text.isBlank()) {
-            FetchedSource("", title, "Web page", error = "No readable content found.")
-        } else {
-            FetchedSource(text, title, "Web page")
         }
     }
 
-    // ── HTTP helpers ──────────────────────────────────────────────────────────
+    private data class HttpResult(val code: Int, val body: String) {
+        val length: Int get() = body.length
+    }
 
-    private data class HttpResult(
-        val code: Int,
-        val body: String,
-        val contentType: String = "",
-        val finalUrl: String = "",
-        val error: String = "",
-    )
-
-    private fun youtubeGet(
-        url: String,
-        userAgent: String,
-        referer: String? = null,
-    ): HttpResult {
-        val builder = Request.Builder()
+    private fun youtubeGet(url: String, userAgent: String): HttpResult {
+        val request = Request.Builder()
             .url(url)
             .header("User-Agent", userAgent)
             .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Accept", "*/*")
-            .header("DNT", "1")
-        if (!referer.isNullOrBlank()) builder.header("Referer", referer)
-        return execute(builder.get().build())
-    }
-
-    private fun generalGet(url: String): HttpResult {
-        val request = Request.Builder()
-            .url(url)
-            .header("User-Agent", DESKTOP_UA)
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .get()
             .build()
         return execute(request)
+    }
+
+    private fun generalGet(url: String, referer: String?): HttpResult {
+        val builder = Request.Builder().url(url)
+        if (referer != null) builder.header("Referer", referer)
+        return execute(builder.build())
     }
 
     private fun youtubePostJson(
@@ -976,80 +891,67 @@ class SourceFetcher {
         referer: String?,
         includeWebHeaders: Boolean = false,
     ): HttpResult {
-        val body = json.toString().toRequestBody(JSON_MEDIA_TYPE)
         val builder = Request.Builder()
             .url(url)
             .header("User-Agent", userAgent)
-            .header("Accept", "application/json")
-            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Content-Type", "application/json")
+            .header("X-Goog-Api-Key", "")
             .header("X-YouTube-Client-Name", clientNameHeader)
             .header("X-YouTube-Client-Version", clientVersion)
-            .header("Content-Type", "application/json")
+            .post(json.toString().toRequestBody(JSON_MEDIA_TYPE))
+        if (visitorData.isNotBlank()) builder.header("X-Goog-Visitor-Id", visitorData)
+        if (referer != null) builder.header("Referer", referer)
         if (includeWebHeaders) {
             builder.header("Origin", "https://www.youtube.com")
-            if (!referer.isNullOrBlank()) builder.header("Referer", referer)
-            builder.header("X-Goog-AuthUser", "0")
-            builder.header("X-YouTube-Bootstrap-Logged-In", "false")
+            builder.header("Accept", "*/*")
         }
-        if (visitorData.isNotBlank()) builder.header("X-Goog-Visitor-Id", visitorData)
-        return execute(builder.post(body).build())
+        return execute(builder.build())
     }
 
     private fun execute(request: Request): HttpResult {
         return try {
-            http.newCall(request).execute().use { response ->
-                HttpResult(
-                    code = response.code,
-                    body = response.body?.string().orEmpty(),
-                    contentType = response.header("Content-Type").orEmpty(),
-                    finalUrl = response.request.url.toString(),
-                )
+            http.newCall(request).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                HttpResult(resp.code, body)
             }
-        } catch (e: Exception) {
-            HttpResult(
-                code = -1,
-                body = "",
-                finalUrl = request.url.toString(),
-                error = diagnosticMessage(e),
-            )
+        } catch (e: IOException) {
+            HttpResult(0, "")
         }
     }
 
     private class MemoryCookieJar : CookieJar {
-        private val cookies = mutableListOf<Cookie>()
-
-        @Synchronized
+        private val store = mutableMapOf<String, MutableList<Cookie>>()
         override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-            for (cookie in cookies) put(cookie)
+            val key = "${url.host}${url.encodedPath}"
+            store.getOrPut(key) { mutableListOf() }.addAll(cookies)
         }
-
-        @Synchronized
         override fun loadForRequest(url: HttpUrl): List<Cookie> {
-            val now = System.currentTimeMillis()
-            cookies.removeAll { it.expiresAt < now }
-            return cookies.filter { it.matches(url) }
+            val key = "${url.host}${url.encodedPath}"
+            return store[key] ?: emptyList()
         }
-
-        @Synchronized
         fun put(cookie: Cookie) {
-            cookies.removeAll {
-                it.name == cookie.name && it.domain == cookie.domain && it.path == cookie.path
-            }
-            cookies += cookie
+            val key = "${cookie.domain}${cookie.path}"
+            val list = store.getOrPut(key) { mutableListOf() }
+            list.removeAll { it.name == cookie.name }
+            list.add(cookie)
         }
     }
 
-    private fun String.normalizeWhitespace(): String =
-        replace('\u00A0', ' ').replace(Regex("\\s+"), " ").trim()
+    private fun normalizeWhitespace(s: String): String =
+        s.replace(Regex("\\s+"), " ").trim()
 
-    private fun minutesFromMs(milliseconds: Long): Int =
-        if (milliseconds <= 0L) 0 else ceil(milliseconds / 60_000.0).toInt()
+    private fun minutesFromMs(ms: Long): Int = ceil(ms / 60000.0).toInt()
 
-    private fun diagnosticMessage(error: Throwable): String =
-        (error.message ?: error.javaClass.simpleName)
-            .replace(';', ',')
-            .replace('\n', ' ')
-            .take(180)
+    private fun estimateDurationMs(text: String): Long {
+        // Rough: ~15 words per second of speech.
+        val words = text.split(Regex("\\s+")).size
+        return (words / 15.0 * 1000).toLong()
+    }
+
+    private fun diagnosticMessage(e: Exception): String = e.message
+        ?.replace(';', ',')
+        .replace('\n', ' ')
+        ?.take(180) ?: e.javaClass.simpleName
 
     private fun watchUrl(videoId: String): String =
         "https://www.youtube.com/watch?v=$videoId&hl=en&gl=US&persist_hl=1&persist_gl=1"
@@ -1067,7 +969,8 @@ class SourceFetcher {
         const val WEB_CLIENT_NAME_HEADER = "1"
 
         const val FALLBACK_WEB_CLIENT_VERSION = "2.20240726.00.00"
-        const val PUBLIC_INNERTUBE_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"
+        // SECURITY: no hardcoded Google/YouTube API key. The key must come
+        // from the watch page; if absent, the get_transcript path is skipped.
 
         const val DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
