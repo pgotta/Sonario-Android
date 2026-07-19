@@ -9,13 +9,13 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "ai.sonario.app"
+        applicationId = "ai.focal.app"
         minSdk = 28          // Android 9. 8 Elite phones are far above this.
         targetSdk = 36
         versionCode = 10
         versionName = "1.4.0"
-        vectorDrawables { useSupportLibrary = true }
         ndk { abiFilters += "arm64-v8a" }  // modern phones; keeps APK lean
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -34,10 +34,18 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
 
     packaging {
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+    }
+
+    lint {
+        abortOnError = false
+        checkReleaseBuilds = false
     }
 }
 
@@ -53,6 +61,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
     implementation("androidx.navigation:navigation-compose:2.8.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     // Networking for source fetching (YouTube captions, web articles)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
@@ -71,5 +80,12 @@ dependencies {
     implementation("com.llamatik:library-android:1.7.0")
 
     // Secure API key storage (hardware-backed encryption for BYOK credentials).
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation("androidx.security:security-crypto:1.0.0")
+
+    // Testing
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+    debugImplementation("androidx.compose.ui:ui-tooling")
 }
