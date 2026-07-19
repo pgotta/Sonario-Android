@@ -18,17 +18,24 @@ import kotlinx.coroutines.delay
  * exceed the per-minute budget, we wait until the rolling minute window has room.
  * Actual usage is reconciled from response headers when present. The daily total
  * is persisted so it survives app restarts within the same day.
+ *
+ * Thread-safe: all access to the rolling window and the daily SharedPreferences
+ * counter is serialized through [windowLock]. Multiple concurrent cloud requests
+ * can safely share one [RateLimiter] instance.
  */
 class RateLimiter(context: Context, private val config: Config = Config()) {
 
     private val prefs = context.applicationContext
-        .getSharedPreferences("groq_rate", Context.MODE_PRIVATE)
+        .getSharedPreferences("rate_limiter", Context.MODE_PRIVATE)
 
     private val tpmLimit = config.tokensPerMinute
     private val tpdLimit = config.tokensPerDay
 
     // Rolling per-minute window: timestamps (ms) paired with tokens spent.
+    // Synchronized because multiple concurrent cloud requests can call
+    // record() / waitMillisFor() from different IO threads.
     private val window = ArrayDeque<Pair<Long, Long>>()
+    private val windowLock = Any()
 
     data class Config(
         val tokensPerMinute: Long = 28_000L,     // under the ~30k/min cap
@@ -53,19 +60,21 @@ class RateLimiter(context: Context, private val config: Config = Config()) {
     }
 
     private fun addDaily(tokens: Long) {
-        val used = if (prefs.getString("day", null) == today())
-            prefs.getLong("used", 0) else 0
-        prefs.edit()
-            .putString("day", today())
-            .putLong("used", used + tokens)
-            .apply()
+        synchronized(windowLock) {
+            val used = if (prefs.getString("day", null) == today())
+                prefs.getLong("used", 0) else 0
+            prefs.edit()
+                .putString("day", today())
+                .putLong("used", used + tokens)
+                .commit()  // commit() is synchronous; avoids losing counts under concurrency
+        }
     }
 
     fun dailyUsage(): DailyUsage = DailyUsage(dailyUsed(), tpdLimit)
 
     fun resetDaily() {
         prefs.edit().putString("day", today()).putLong("used", 0).apply()
-        window.clear()
+        synchronized(windowLock) { window.clear() }
     }
 
     data class Estimate(
@@ -105,27 +114,33 @@ class RateLimiter(context: Context, private val config: Config = Config()) {
     // ── per-minute pacing ──────────────────────────────────────────────────────
 
     private fun trimWindow(now: Long) {
-        while (window.isNotEmpty() && now - window.first().first >= 60_000L) {
-            window.removeFirst()
+        synchronized(windowLock) {
+            while (window.isNotEmpty() && now - window.first().first >= 60_000L) {
+                window.removeFirst()
+            }
         }
     }
 
     private fun tokensInWindow(now: Long): Long {
-        trimWindow(now)
-        return window.sumOf { it.second }
+        synchronized(windowLock) {
+            trimWindow(now)
+            return window.sumOf { it.second }
+        }
     }
 
     fun waitMillisFor(tokens: Long): Long {
-        val now = System.currentTimeMillis()
-        val inWindow = tokensInWindow(now)
-        if (inWindow + tokens <= tpmLimit) return 0
-        var needed = inWindow + tokens - tpmLimit
-        var waitUntil = now
-        for ((ts, tok) in window) {
-            needed -= tok
-            if (needed <= 0) { waitUntil = ts + 60_000L; break }
+        synchronized(windowLock) {
+            val now = System.currentTimeMillis()
+            val inWindow = tokensInWindow(now)
+            if (inWindow + tokens <= tpmLimit) return 0
+            var needed = inWindow + tokens - tpmLimit
+            var waitUntil = now
+            for ((ts, tok) in window) {
+                needed -= tok
+                if (needed <= 0) { waitUntil = ts + 60_000L; break }
+            }
+            return (waitUntil - now).coerceAtLeast(0)
         }
-        return (waitUntil - now).coerceAtLeast(0)
     }
 
     suspend fun awaitSlot(tokens: Long, onWaiting: (Long) -> Unit) {
@@ -139,10 +154,12 @@ class RateLimiter(context: Context, private val config: Config = Config()) {
     }
 
     fun record(tokens: Long) {
-        val now = System.currentTimeMillis()
-        trimWindow(now)
-        window.addLast(now to tokens)
-        addDaily(tokens)
+        synchronized(windowLock) {
+            val now = System.currentTimeMillis()
+            trimWindow(now)
+            window.addLast(now to tokens)
+            addDaily(tokens)
+        }
     }
 
     companion object {
