@@ -62,8 +62,8 @@ dependencies {
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
 
     // Markdown rendering for summary output.
-    implementation("com.mikepenz:multiplatform-markdown-renderer:0.27.0")
-    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.27.0")
+    implementation("com.mikepenz:multiplatform-markdown-renderer:0.43.0")
+    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.43.0")
 
     // Latest Llamatik/llama.cpp Android runtime for Qwen3, Gemma 3n and LFM2 GGUFs.
     implementation("com.llamatik:library-android:1.8.1")
