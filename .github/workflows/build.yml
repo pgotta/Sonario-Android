@@ -3,9 +3,13 @@ name: Build & Release
 on:
   push:
     branches: [ main, 'upgrade/**' ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -38,46 +42,18 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Lint
+      - name: Run lint
         run: ./gradlew lintDebug --no-daemon --stacktrace
 
       - name: Build debug APK
         run: ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Build release APK
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-
-      - name: Build release AAB
-        run: ./gradlew bundleRelease --no-daemon --stacktrace
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-
-      - name: Upload debug APK
+      - name: Upload debug APK artifact
         uses: actions/upload-artifact@v6
         with:
-          name: app-debug
+          name: focal-debug-apk
           path: app/build/outputs/apk/debug/*.apk
-          retention-days: 30
-
-      - name: Upload release APK
-        uses: actions/upload-artifact@v6
-        with:
-          name: app-release
-          path: app/build/outputs/apk/release/*.apk
-          retention-days: 30
-
-      - name: Upload release AAB
-        uses: actions/upload-artifact@v6
-        with:
-          name: app-release-aab
-          path: app/build/outputs/bundle/release/*.aab
-          retention-days: 30
+          retention-days: 90
 
       - name: Upload lint report
         if: always()
@@ -89,20 +65,57 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/upgrade/'))
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v6
-
-      - name: Create GitHub Release
-        uses: softprops/gh-action-gh-release@v2
         with:
-          files: |
-            app-debug/*.apk
-            app-release/*.apk
-            app-release-aab/*.aab
-          generate_release_notes: true
+          name: focal-debug-apk
+          path: ./artifacts
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+            echo "name=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=latest" >> $GITHUB_OUTPUT
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+            echo "name=Latest Build (${GITHUB_REF_NAME})" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create / Update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.name }}
+          body: |
+            ## Focal for Android
+
+            Multi-provider BYOK AI summariser. Paste any YouTube link, article URL, or text and get a summary powered by the LLM provider you choose.
+
+            ### Downloads
+            - **focal-debug.apk** — debug build, install directly on your phone
+
+            ### Setup
+            1. Download and install the APK (allow "install from unknown sources")
+            2. Open Focal → tap the gear icon
+            3. Choose **On-device** or **Cloud**
+            4. If Cloud, pick a provider and paste your API key
+            5. Pick a model and start summarising
+
+            ### Supported providers
+            - Groq (free tier)
+            - OpenAI
+            - Anthropic (Claude)
+            - Ollama (local, no key needed)
+            - Custom (any OpenAI-compatible proxy)
+          files: ./artifacts/*.apk
+          prerelease: ${{ steps.tag.outputs.prerelease }}
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
