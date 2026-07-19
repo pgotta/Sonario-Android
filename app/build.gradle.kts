@@ -55,7 +55,7 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.8.1")
 
     // Networking for source fetching and resumable model downloads.
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.squareup.okhttp3:okhttp:5.4.0")
     implementation("org.jsoup:jsoup:1.18.1")
 
     // Local document extraction.
