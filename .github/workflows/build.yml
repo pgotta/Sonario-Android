@@ -1,12 +1,11 @@
-name: Build & Release
+name: Build APK
 
 on:
   push:
     branches: [ main, 'upgrade/**' ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
@@ -38,50 +37,3 @@ jobs:
           name: focal-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 90
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download APK artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: focal-debug-apk
-          path: ./artifacts
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v1.4.0
-          name: Focal v1.4.0
-          body: |
-            ## Focal for Android v1.4.0
-
-            Multi-provider BYOK AI summariser. Paste any YouTube link, article URL, or text and get a summary powered by the LLM provider you choose.
-
-            ### What's new in v1.4.0
-            - **Multi-provider**: Groq, OpenAI, Anthropic (Claude), Ollama, Custom proxy
-            - **BYOK**: Bring your own API key, stored encrypted in Android Keystore
-            - **Renamed** from Sonario to Focal
-
-            ### Download
-            - **focal-debug.apk** — debug build, install directly on your phone
-
-            ### Setup
-            1. Download and install the APK (allow "install from unknown sources")
-            2. Open Focal → tap the gear icon
-            3. Choose **On-device** or **Cloud**
-            4. If Cloud, pick a provider and paste your API key
-            5. Pick a model and start summarising
-
-            ### Supported providers
-            - Groq (free tier)
-            - OpenAI
-            - Anthropic (Claude)
-            - Ollama (local, no key needed)
-            - Custom (any OpenAI-compatible proxy)
-          files: ./artifacts/*.apk
-          prerelease: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
