@@ -6,14 +6,14 @@ or a bulleted outline.
 
 **Status:** working. YouTube transcript summarization, web-article and pasted-text
 summarization, Groq cloud, on-device inference, saved sessions, resumable
-checkpoints, and source Q&A are functional as of version 1.3.3.
+checkpoints, and source Q&A are functional as of version 1.4.0.
 
 Sonario has two engines, and you pick which to use per summary:
 
 - **Groq cloud** (recommended) - sends your text to Groq's API and summarizes
-  with a large model (Llama 4 Scout by default) in seconds. Fast, handles big
-  documents in one pass. You bring your own free API key. Your text goes to
-  Groq's servers.
+  with Qwen 3.6 27B. Sonario splits large sources into rate-safe requests, waits
+  for Groq's minute windows, and checkpoints each completed call. You bring your
+  own API key. Your text goes to Groq's servers.
 - **On-device** - runs a model locally via llama.cpp. Private (nothing leaves the
   phone except fetching the link), but slow: CPU-only, so a summary takes minutes
   and the phone warms up. A private fallback rather than the daily driver.
@@ -22,6 +22,10 @@ Sonario has two engines, and you pick which to use per summary:
 
 - Summarizes YouTube captions, web articles, pasted text, PDF, EPUB, DOCX, TXT,
   and Markdown files.
+- Uses `qwen/qwen3.6-27b` as the only Groq cloud model, preventing retired model
+  IDs from being restored by an old setting or saved session.
+- Queues cloud requests against conservative TPM/RPM limits and Groq's live reset
+  headers instead of repeatedly failing with minute-based 429 errors.
 - Keeps long cloud summaries alive with a foreground service and retries
   temporary DNS, timeout, and network-handoff failures.
 - Saves up to 12 recent sessions locally, restores the latest session on launch,
@@ -51,10 +55,16 @@ Sonario has two engines, and you pick which to use per summary:
 1. Install the APK (see below) and open Sonario.
 2. On the first screen, tap **Use Groq cloud instead** (skips the local-model
    download).
-3. Get a free Groq API key at console.groq.com (no credit card). Create a key.
+3. Get a Groq API key at console.groq.com and create a key.
 4. In Sonario's Settings, paste the key and tap **Save key**.
 5. Back on the main screen, make sure the toggle is on **Groq cloud**, paste a
    YouTube link or article URL, and tap **Summarize**.
+
+Qwen 3.6 27B's published Groq free-tier baseline is 8K tokens per minute and
+200K tokens per day, applied across the whole Groq organization. Sonario uses
+slightly lower internal working limits for safety, follows the provider's live
+remaining-token/reset headers, and displays a countdown between calls. Extra
+keys in the same organization share the same quota and do not multiply it.
 
 ## Quick start (on-device, fully private)
 
@@ -107,18 +117,31 @@ no captions. These are still undocumented YouTube endpoints, so a future YouTube
 change can require another extractor update. Failed requests show **Extractor
 build 2** diagnostics so you can confirm the new APK is actually installed.
 
+## Qwen cloud and rate-aware queueing (1.4.0)
+
+- The Groq cloud path is pinned to `qwen/qwen3.6-27b`; old model preferences and
+  saved Scout session IDs can no longer control the request model.
+- Source chunks, detailed-output budgets, chapter excerpts, and Ask excerpts are
+  sized so one call fits beneath the free-tier 8K TPM ceiling.
+- Sonario leaves headroom below the published TPM/RPM/daily limits, reads Groq's
+  `x-ratelimit-remaining-tokens` and reset headers, and waits with a visible
+  countdown before the next call.
+- Routine summaries use Qwen's non-thinking mode to avoid spending output tokens
+  on hidden reasoning that is unnecessary for summarization.
+- When Groq reports daily exhaustion, Sonario stops rather than waiting all day.
+  Every completed call remains checkpointed so Resume continues later.
 
 ## Background reliability and Ask fixes (1.2.0)
 
-- Cloud requests now retry transient DNS, Wi-Fi/mobile-data handoff, connection,
-  and timeout failures for up to ten minutes instead of immediately ending with
+- Cloud requests retry transient DNS, Wi-Fi/mobile-data handoff, connection, and
+  timeout failures for up to ten minutes instead of immediately ending with
   `Unable to resolve host api.groq.com`.
 - A foreground service holds a partial CPU wake lock and a temporary Wi-Fi lock
   only while a summary or source question is active. The notification displays
   rate-limit waits and network-retry status.
 - Groq responses are buffered before being committed to a summary, so a failed
   connection can be retried without duplicating a partial response.
-- The Ask box now shows the actual API/network error in place, keeps the typed
+- The Ask box shows the actual API/network error in place, keeps the typed
   question after a failure, and searches relevant passages across the whole
   source instead of sending only the first portion of a long video or book.
 - Long jobs have a visible Cancel control, stale errors clear when a new source is
@@ -153,12 +176,13 @@ and the summarize pipeline talks only to that:
 
 - `llm/InferenceEngine.kt` - shared interface (`ensureReady`, `stream`).
 - `llm/LlmEngine.kt` - on-device via Llamatik/llama.cpp.
-- `llm/GroqEngine.kt` - Groq cloud via the OpenAI-compatible streaming API.
+- `llm/GroqEngine.kt` - Qwen 3.6 through Groq's OpenAI-compatible streaming API.
+- `llm/RateLimiter.kt` - local pacing plus synchronization with Groq reset headers.
 - `llm/ModelDownloader.kt` - resumable GGUF download.
-- `data/Settings.kt` - engine choice, Groq key, Groq model (local prefs).
+- `data/Settings.kt` - engine choice and Groq key (local preferences).
 - `source/SourceFetcher.kt` - YouTube (InnerTube) and web-article fetching.
-- `summarize/SummarizeEngine.kt` - map-reduce summarizer; chunking adapts to the
-  engine (small bounded chunks on-device, large/one-pass for the 128k cloud model).
+- `summarize/SummarizeEngine.kt` - map-reduce summarizer with bounded cloud calls
+  sized for Groq's TPM limits and small CPU-bounded on-device chunks.
 - `summarize/Prompts.kt` - prompts carried over from Sonario desktop.
 - `ui/` - Compose screens, theme, settings, the CPU/RAM meter, crash screen.
 - `CrashReporter.kt` - global uncaught-exception logger.
@@ -182,13 +206,22 @@ MIT. See LICENSE.
 
 ## Clear all saved sessions (1.3.1)
 
-The Recent sessions card now has a **Clear** button. After confirmation, it permanently deletes all locally saved session folders, including source transcripts, chapter data, summaries, checkpoints, and saved Q&A. Exported files outside the app are left alone.
+The Recent sessions card has a **Clear** button. After confirmation, it
+permanently deletes all locally saved session folders, including source
+transcripts, chapter data, summaries, checkpoints, and saved Q&A. Exported files
+outside the app are left alone.
 
 ## Saved and resumable sessions (1.3.0)
 
-Sonario now saves summaries locally instead of keeping the only copy in an Activity/ViewModel. The most recent session is restored after an app or Activity restart, and a Recent sessions panel can open, resume, or delete prior work.
+Sonario saves summaries locally instead of keeping the only copy in an
+Activity/ViewModel. The most recent session is restored after an app or Activity
+restart, and a Recent sessions panel can open, resume, or delete prior work.
 
-For long summaries, Sonario checkpoints after every completed LLM call. If Android or the network interrupts the run, Resume skips already-completed condensed chunks and derived views so those Groq tokens are not spent twice. Completed source text and Ask history are stored with the session. Up to 12 recent sessions are retained in the app's private files directory.
+For long summaries, Sonario checkpoints after every completed LLM call. If
+Android or the network interrupts the run, Resume skips already-completed
+condensed chunks and derived views so those Groq tokens are not spent twice.
+Completed source text and Ask history are stored with the session. Up to 12
+recent sessions are retained in the app's private files directory.
 
 ## Keyboard-safe Ask field (1.3.3)
 
